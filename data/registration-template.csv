@@ -1,0 +1,3 @@
+plateNumber,vehicleType,make,model,color,ownerName,ownerPhone,driverName,driverPhone,purpose,accessType,validFrom,validUntil,password
+AP12JA1234,Car,Honda,City,White,Ravi Kumar,9876543210,Ravi Kumar,9876543210,Employee,Permanent,2026-09-05,2026-12-31,customer123
+TS09GH4567,Bus,Ashok Leyland,Viking,White,Anita Sharma,9866501234,Anita Sharma,9866501234,Student,Temporary,2026-09-05,2026-12-31,customer456

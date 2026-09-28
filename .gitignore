@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Dependencies and build output
+node_modules/
+dist/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Runtime output and caches
+runs/
+output/
+logs/
+.pytest_cache/
+*.log
+
+# Data and models (optional)
+models/*.pt
+models/*.weights
+output/detected/*.png
+output/detected/*.jpg
+output/results/*.csv
+
+# OS
+.DS_Store
+Thumbs.db

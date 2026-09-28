@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Sentinel vehicle intelligence logo</title>
+  <desc id="desc">A blue-lit shield with a camera lens and vehicle silhouette.</desc>
+  <defs>
+    <linearGradient id="shield" x1="30" y1="20" x2="220" y2="235" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f3f7ff" />
+      <stop offset=".22" stop-color="#52647c" />
+      <stop offset=".5" stop-color="#101b2a" />
+      <stop offset="1" stop-color="#050910" />
+    </linearGradient>
+    <radialGradient id="lens" cx="50%" cy="42%" r="58%">
+      <stop stop-color="#43c9ff" />
+      <stop offset=".18" stop-color="#0c5a9c" />
+      <stop offset=".52" stop-color="#071a35" />
+      <stop offset="1" stop-color="#02050b" />
+    </radialGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="3" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
+  </defs>
+  <path d="M128 8 235 42v82c0 60-42 98-107 124C63 222 21 184 21 124V42z" fill="#050a12" stroke="url(#shield)" stroke-width="10" />
+  <path d="M128 25 219 54v69c0 50-32 82-91 108-59-26-91-58-91-108V54z" fill="#0a1422" stroke="#253e5d" stroke-width="3" />
+  <path d="M91 76q37-20 74 0l10 27H81z" fill="#bec9d8" stroke="#eef6ff" stroke-width="3" />
+  <path d="M93 78h70l8 19H85z" fill="#28394e" />
+  <path d="M86 103h84v7H86z" fill="#0a101a" />
+  <circle cx="128" cy="145" r="48" fill="#07101d" stroke="#90a7c3" stroke-width="5" />
+  <circle cx="128" cy="145" r="39" fill="url(#lens)" stroke="#168ee0" stroke-width="5" filter="url(#glow)" />
+  <circle cx="128" cy="145" r="17" fill="#020711" stroke="#5dbdff" stroke-width="3" />
+  <circle cx="121" cy="137" r="5" fill="#d8f5ff" />
+  <path d="M69 143H45m142 0h24M76 169l-17 13m121-13 17 13" stroke="#2baeff" stroke-width="4" filter="url(#glow)" />
+  <path d="M91 197h74l-8 18h-58z" fill="#c9d4e1" stroke="#eff7ff" stroke-width="3" />
+  <path d="M105 231v-14h46v14" fill="none" stroke="#45bfff" stroke-width="4" />
+</svg>
