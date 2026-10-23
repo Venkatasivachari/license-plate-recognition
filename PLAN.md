@@ -17,6 +17,7 @@
 - New columns: `visitor_name`, `purpose_description`, `invited_by_role`, `destination`, `notes`, user-created permission windows (`valid_from`, `valid_until`, `allowed_entry_from`, `allowed_entry_until`, `reason`).
 - Role-scoped records, admin status transitions (`ACTIVE`/`BLOCKED`/`CANCELLED`/`EXPIRED`) with audit logs.
 
+
 ### Realtime + retention
 - Backend WebSocket `/ws` pushes live access events; Supabase realtime published for `invitations` and `visits`.
 - Retention = Policy B: `public.cleanup_old_records()` deletes everything older than 31 days (dependent-order). Backend invokes it on boot and every 6 hours.

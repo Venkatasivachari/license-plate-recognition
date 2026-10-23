@@ -2,6 +2,9 @@ import cv2
 import easyocr
 import numpy as np
 import os
+import torch
+
+from plate_validator import validate_plate
 
 
 # ============================================================
@@ -12,7 +15,7 @@ print("Loading EasyOCR...")
 
 reader = easyocr.Reader(
     ["en"],
-    gpu=False
+    gpu=torch.cuda.is_available()
 )
 
 print("EasyOCR loaded.")
@@ -28,6 +31,7 @@ PLATE_WIDTH = 800
 
 PLATE_HEIGHT = 300
 OCR_EARLY_STOP_CONFIDENCE = float(os.getenv("LPRS_OCR_EARLY_STOP", "0.88"))
+OCR_VALID_EARLY_STOP_CONFIDENCE = float(os.getenv("LPRS_OCR_VALID_EARLY_STOP", "0.55"))
 
 
 # ============================================================
@@ -50,10 +54,12 @@ def create_variants(image):
     # Resize
     # --------------------------------------------------------
 
+    source_height, source_width = image.shape[:2]
+    scale = min(PLATE_WIDTH / source_width, PLATE_HEIGHT / source_height)
     resized = cv2.resize(
         image,
-        (PLATE_WIDTH, PLATE_HEIGHT),
-        interpolation=cv2.INTER_CUBIC
+        (max(1, round(source_width * scale)), max(1, round(source_height * scale))),
+        interpolation=cv2.INTER_CUBIC,
     )
 
     variants.append(
@@ -266,7 +272,7 @@ def run_ocr(image):
 # READ LICENSE PLATE
 # ============================================================
 
-def read_plate(plate):
+def read_plate(plate, max_variants: int | None = None):
 
     if plate is None:
 
@@ -281,11 +287,14 @@ def read_plate(plate):
     variants = create_variants(
         plate
     )
+    if max_variants is not None:
+        variants = variants[:max(1, int(max_variants))]
 
 
     best_text = ""
 
     best_confidence = 0.0
+    best_is_valid = False
 
 
     for name, image in variants:
@@ -302,11 +311,16 @@ def read_plate(plate):
         )
 
 
-        if confidence > best_confidence:
+        is_valid = bool(text and validate_plate(text)["valid"])
+        if (is_valid and not best_is_valid) or (is_valid == best_is_valid and confidence > best_confidence):
 
             best_text = text
 
             best_confidence = confidence
+            best_is_valid = is_valid
+
+        if is_valid and confidence >= OCR_VALID_EARLY_STOP_CONFIDENCE:
+            break
 
         if text and confidence >= OCR_EARLY_STOP_CONFIDENCE and len(text) >= 6:
             break

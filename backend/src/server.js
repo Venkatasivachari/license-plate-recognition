@@ -17,6 +17,7 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
+const AI_HEALTH_URL = process.env.LPRS_AI_URL || "http://localhost:5001";
 const EVIDENCE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../output/evidence");
 const EVENT_DEDUPLICATION_WINDOW_MS = Number(process.env.EVENT_DEDUPLICATION_WINDOW_MS || 30000);
 const recentEventKeys = new Map();
@@ -31,6 +32,30 @@ const toAuthEmail = (username) => {
 };
 const broadcast = (message) => { const encoded = JSON.stringify(message); for (const socket of sockets) if (socket.readyState === 1) socket.send(encoded); };
 const fail = (response, status, error) => response.status(status).json({ error: String(error) });
+
+async function getDatabaseHealth() {
+  if (!supabaseConfigured) return { status: "IN_MEMORY", connected: false };
+  try {
+    const { error } = await supabase.from("vehicles").select("id", { head: true }).limit(1);
+    if (error) return { status: "ERROR", connected: false, error: error.message };
+    return { status: "CONNECTED", connected: true };
+  } catch (error) {
+    return { status: "ERROR", connected: false, error: error.message };
+  }
+}
+
+async function getAiHealth() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2000);
+  try {
+    const response = await fetch(`${AI_HEALTH_URL}/health`, { signal: controller.signal });
+    return { status: response.ok ? "ONLINE" : "ERROR", connected: response.ok };
+  } catch (error) {
+    return { status: "OFFLINE", connected: false, error: error.name === "AbortError" ? "Health check timed out" : error.message };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 const publicEvent = (row) => ({
   ...row,
@@ -56,11 +81,14 @@ const isDuplicateEvent = (payload, now = Date.now()) => {
   const key = eventKey(payload);
   if (key === ":UNKNOWN") return false;
   const previous = recentEventKeys.get(key);
-  recentEventKeys.set(key, now);
   for (const [storedKey, timestamp] of recentEventKeys) {
     if (now - timestamp > EVENT_DEDUPLICATION_WINDOW_MS) recentEventKeys.delete(storedKey);
   }
   return previous !== undefined && now - previous < EVENT_DEDUPLICATION_WINDOW_MS;
+};
+const rememberEvent = (payload, now = Date.now()) => {
+  const key = eventKey(payload);
+  if (key !== ":UNKNOWN") recentEventKeys.set(key, now);
 };
 
 async function writeAudit(action, entityType, entityId, request, metadata = {}) {
@@ -132,9 +160,11 @@ async function evaluateAccess(plateNumber, at = new Date(), ocrContext = {}) {
     return { vehicle: null, invitation: null, permission: null, status: "OCR_FAILED", decision: "UNKNOWN", reason: "No plate supplied" };
   }
 
-  let { data: vehicle } = await supabase.from("vehicles").select("*").eq("normalized_plate", plate).maybeSingle();
+  let { data: vehicle, error: vehicleError } = await supabase.from("vehicles").select("*").eq("normalized_plate", plate).maybeSingle();
+  if (vehicleError) throw vehicleError;
   if (!vehicle) {
     const fallback = await supabase.from("vehicles").select("*").eq("plate_number", plate).maybeSingle();
+    if (fallback.error) throw fallback.error;
     vehicle = fallback.data || null;
   }
   if (vehicle?.status === "BLOCKED" || vehicle?.registration_status === "BLOCKED") {
@@ -143,7 +173,7 @@ async function evaluateAccess(plateNumber, at = new Date(), ocrContext = {}) {
 
   // 1) Registered vehicle with an ACTIVE permission inside its time window
   if (vehicle) {
-    const { data: permission } = await supabase.from("permissions")
+    const { data: permission, error: permissionError } = await supabase.from("permissions")
       .select("*")
       .eq("normalized_plate", plate)
       .in("status", ["ACTIVE", "PERMANENT"])
@@ -152,6 +182,7 @@ async function evaluateAccess(plateNumber, at = new Date(), ocrContext = {}) {
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
+    if (permissionError) throw permissionError;
 
     const permissionValid = permission && (!permission.valid_from || timestamp >= permission.valid_from) && (!permission.valid_until || timestamp <= permission.valid_until);
     if (permissionValid && permission.status === "BLOCKED") {
@@ -174,12 +205,13 @@ async function evaluateAccess(plateNumber, at = new Date(), ocrContext = {}) {
   }
 
   // 3) Invitation for registered or unregistered vehicle
-  const { data: invitation } = await supabase.from("invitations")
+  const { data: invitation, error: invitationError } = await supabase.from("invitations")
     .select("*")
     .eq("normalized_plate", plate)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
+  if (invitationError) throw invitationError;
 
   if (invitation) {
     if (invitation.status === "BLOCKED") return { vehicle, invitation, permission: null, status: "INVITATION_BLOCKED", decision: "UNAUTHORIZED", reason: "Invitation is blocked" };
@@ -201,7 +233,8 @@ async function persistEvent(payload) {
   const timestamp = payload.timestamp || new Date().toISOString();
   const idempotencyKey = String(payload.idempotencyKey || payload.idempotency_key || `${payload.cameraId || "laptop-browser-1"}:${timestamp}:${plateNumber || "NO_PLATE"}`);
 
-  const { data: existing } = await supabase.from("detections").select("*").eq("idempotency_key", idempotencyKey).maybeSingle();
+  const { data: existing, error: existingError } = await supabase.from("detections").select("*").eq("idempotency_key", idempotencyKey).maybeSingle();
+  if (existingError) throw existingError;
   if (existing) return publicEvent(existing);
 
   const access = await evaluateAccess(plateNumber, timestamp, payload);
@@ -216,7 +249,7 @@ async function persistEvent(payload) {
     plate_number: plateNumber,
     normalized_plate: plateNumber,
     vehicle_id: access.vehicle?.id || null,
-    vehicle_type: payload.vehicleType || payload.vehicle_type || access.vehicle?.vehicle_type || "Unknown",
+    vehicle_type: access.vehicle?.vehicle_type || access.invitation?.vehicle_type || payload.vehicleType || payload.vehicle_type || "Unknown",
     raw_ocr: payload.raw_ocr || payload.rawOcr || null,
     ocr_confidence: ocrConfidence,
     yolo_confidence: Number(payload.yolo_confidence ?? payload.yoloConfidence ?? 0),
@@ -237,19 +270,26 @@ async function persistEvent(payload) {
   const publicResult = {
     ...publicEvent(inserted),
     decision,
-    ownerName: access.vehicle?.owner_name || "N/A",
+    ownerName: access.vehicle?.owner_name || access.invitation?.person || "N/A",
     purpose: inserted.purpose,
     source: inserted.source,
     decisionStatus: access.status,
     decisionReason: access.reason || null,
+    ocr_consensus: Number(payload.ocr_consensus || 0),
+    format_valid: payload.format_valid === true,
   };
 
   // Update or create visit
-  const { data: activeVisit } = await supabase.from("visits").select("id").eq("normalized_plate", plateNumber).is("exit_time", null).maybeSingle();
+  const { data: activeVisit, error: activeVisitError } = await supabase.from("visits").select("id").eq("normalized_plate", plateNumber).is("exit_time", null).maybeSingle();
+  if (activeVisitError) {
+    await supabase.from("detections").delete().eq("id", inserted.id);
+    throw activeVisitError;
+  }
+  let visitError = null;
   if (activeVisit?.id) {
-    await supabase.from("visits").update({ last_seen_at: timestamp, status, authorization_status: decision, detection_id: inserted.id }).eq("id", activeVisit.id);
+    ({ error: visitError } = await supabase.from("visits").update({ last_seen_at: timestamp, status, authorization_status: decision, detection_id: inserted.id }).eq("id", activeVisit.id));
   } else if (plateNumber) {
-    await supabase.from("visits").insert({
+    ({ error: visitError } = await supabase.from("visits").insert({
       plate_number: plateNumber,
       normalized_plate: plateNumber,
       vehicle_id: access.vehicle?.id || null,
@@ -260,7 +300,11 @@ async function persistEvent(payload) {
       authorization_status: decision,
       purpose: inserted.purpose,
       source: inserted.source,
-    });
+    }));
+  }
+  if (visitError) {
+    await supabase.from("detections").delete().eq("id", inserted.id);
+    throw visitError;
   }
 
   // Update or create vehicle session
@@ -289,23 +333,24 @@ async function persistEvent(payload) {
 
   // Create alert for suspicious events
   if (["UNAUTHORIZED", "BLOCKED", "EXPIRED", "UNREGISTERED", "PERMISSION_BLOCKED", "PERMISSION_EXPIRED", "INVITATION_BLOCKED", "INVITATION_EXPIRED", "OCR_FAILED", "OCR_UNCERTAIN", "INVALID_PLATE"].includes(status)) {
-    const { data: activeAlert } = await supabase.from("alerts")
+    const { data: activeAlert, error: activeAlertError } = await supabase.from("alerts")
       .select("id")
       .eq("plate_number", plateNumber)
       .eq("type", status)
       .eq("is_read", false)
       .gte("created_at", new Date(Date.now() - EVENT_DEDUPLICATION_WINDOW_MS).toISOString())
       .maybeSingle();
+    if (activeAlertError) console.error("Failed to check for a recent alert:", activeAlertError.message);
     if (!activeAlert?.id) {
-      await supabase.from("alerts").insert({
+      const { error: alertInsertError } = await supabase.from("alerts").insert({
         plate_number: plateNumber,
         detection_id: inserted.id,
         type: status,
         severity: decision === "UNAUTHORIZED" ? "HIGH" : (["OCR_FAILED", "OCR_UNCERTAIN"].includes(status) ? "MEDIUM" : "MEDIUM"),
         message: `${status} detected`,
         created_at: timestamp,
-        source: inserted.source,
       });
+      if (alertInsertError) console.error("Failed to persist detection alert:", alertInsertError.message);
     }
   }
 
@@ -315,9 +360,23 @@ async function persistEvent(payload) {
 // ============================================================
 // ROUTES: Health
 // ============================================================
-app.get("/health", (_request, response) => response.json({ status: "ok", service: "backend", database: supabaseConfigured ? "SUPABASE" : "IN_MEMORY" }));
+app.get("/", (_request, response) => response.json({
+  service: "vehicle-security-backend",
+  message: "Backend API is running. Use the health endpoint to inspect database and AI connectivity.",
+  health: "/health",
+  status: "/api/system/status",
+}));
 
-app.get("/api/system/status", (_request, response) => response.json({ api: "ONLINE", database: supabaseConfigured ? "SUPABASE" : "IN_MEMORY", ai: "READY", mode: process.env.DEMO_MODE === "true" ? "DEMO" : "LIVE" }));
+app.get("/health", async (_request, response) => {
+  const [database, ai] = await Promise.all([getDatabaseHealth(), getAiHealth()]);
+  const status = database.status === "ERROR" ? "degraded" : "ok";
+  response.status(status === "ok" ? 200 : 503).json({ status, service: "backend", database, ai });
+});
+
+app.get("/api/system/status", async (_request, response) => {
+  const [database, ai] = await Promise.all([getDatabaseHealth(), getAiHealth()]);
+  response.json({ api: "ONLINE", database, ai, mode: process.env.DEMO_MODE === "true" ? "DEMO" : "LIVE" });
+});
 
 // ============================================================
 // ROUTES: Auth
@@ -738,23 +797,29 @@ app.post("/api/invitations", async (request, response) => {
   if (body.visitorName && body.visitorName.trim().length < 2) return fail(response, 400, "visitor name is too short");
   try {
     const ownerId = isAdmin(request) ? (body.ownerId || body.customerId || request.client.id) : request.client.id;
-    const { data, error } = await supabase.from("invitations").insert({
+    const baseInvitation = {
       owner_id: ownerId && ownerId !== "service" ? ownerId : request.client.id,
       plate_number: plate,
       normalized_plate: plate,
       person: body.person || body.visitorName || null,
-      visitor_name: body.visitorName || body.person || null,
       owner_house_no: body.ownerHouseNo || body.houseNo || null,
       vehicle_type: body.vehicleType || body.vehicle_type || null,
       purpose,
+      start_at: new Date(start).toISOString(),
+      end_at: new Date(end).toISOString(),
+      status: "ACTIVE",
+    };
+    const optionalInvitation = {
+      visitor_name: body.visitorName || body.person || null,
       purpose_description: body.purposeDescription || body.customPurpose || null,
       destination: body.destination || null,
       notes: body.notes || null,
-      start_at: new Date(start).toISOString(),
-      end_at: new Date(end).toISOString(),
       invited_by_role: request.client?.role,
-      status: "ACTIVE",
-    }).select().single();
+    };
+    let { data, error } = await supabase.from("invitations").insert({ ...baseInvitation, ...optionalInvitation }).select().single();
+    if (error && /column|schema cache|PGRST204/i.test(error.message)) {
+      ({ data, error } = await supabase.from("invitations").insert(baseInvitation).select().single());
+    }
     if (error) throw error;
     await writeAudit("INVITATION_CREATED", "invitation", data.id, request, { plateNumber: plate, purpose });
     response.status(201).json({
@@ -763,11 +828,11 @@ app.post("/api/invitations", async (request, response) => {
       startAt: data.start_at,
       endAt: data.end_at,
       person: data.person,
-      visitorName: data.visitor_name,
-      purposeDescription: data.purpose_description,
-      destination: data.destination,
-      notes: data.notes,
-      invitedBy: data.invited_by_role,
+      visitorName: data.visitor_name || body.visitorName || body.person || data.person,
+      purposeDescription: data.purpose_description || body.purposeDescription || body.customPurpose || null,
+      destination: data.destination || body.destination || null,
+      notes: data.notes || body.notes || null,
+      invitedBy: data.invited_by_role || request.client?.role,
       ownerHouseNo: data.owner_house_no,
       duration: Math.max(0, Math.round((new Date(data.end_at) - new Date(data.start_at)) / 60000)),
     });
@@ -781,7 +846,7 @@ app.patch("/api/invitations/:id/status", requireRole("ADMIN"), async (request, r
   if (!["ACTIVE", "BLOCKED", "CANCELLED", "EXPIRED"].includes(status)) return fail(response, 400, "Invalid invitation status");
   try {
     if (!supabaseConfigured) return fail(response, 503, "Supabase is not configured");
-    const { data, error } = await supabase.from("invitations").update({ status, updated_at: new Date().toISOString() }).eq("id", request.params.id).select().single();
+    const { data, error } = await supabase.from("invitations").update({ status }).eq("id", request.params.id).select().single();
     if (error) throw error;
     await writeAudit(`INVITATION_${status}`, "invitation", data.id, request, { plateNumber: data.plate_number });
     response.json({ ...data, plateNumber: data.plate_number, startAt: data.start_at, endAt: data.end_at });
@@ -886,6 +951,7 @@ app.post("/api/events", requireRole("ADMIN"), async (request, response) => {
   try {
     if (isDuplicateEvent(request.body)) return response.status(202).json({ accepted: true, duplicate: true });
     const event = supabaseConfigured ? await persistEvent(request.body) : addEvent(request.body);
+    rememberEvent(request.body);
     broadcast({ type: "vehicle_detected", data: event });
     await writeAudit("DETECTION_RECORDED", "detection", event.id, request, { plateNumber: event.plateNumber, cameraId: event.cameraId || request.body.cameraId || "laptop-browser-1", status: event.status });
     response.status(201).json(event);

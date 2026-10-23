@@ -17,14 +17,18 @@ export function CyberBackground({ variant = "login" }) {
     if (!ctx) return undefined;
 
     let animId = 0;
-    let width = (canvas.width = window.innerWidth);
-    let height = (canvas.height = window.innerHeight);
-    let dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let width = Math.max(1, window.innerWidth || 1);
+    let height = Math.max(1, window.innerHeight || 1);
+    let dpr = 1;
 
     const resize = () => {
-      width = canvas.width = window.innerWidth * dpr;
-      height = canvas.height = window.innerHeight * dpr;
-      ctx.scale(dpr, dpr);
+      const devicePixelRatio = window.devicePixelRatio;
+      dpr = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0 ? Math.min(devicePixelRatio, 2) : 1;
+      width = Math.max(1, window.innerWidth || 1);
+      height = Math.max(1, window.innerHeight || 1);
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     };
     resize();
     window.addEventListener("resize", resize);
@@ -120,8 +124,8 @@ export function CyberBackground({ variant = "login" }) {
           ctx.strokeStyle = isCenter
             ? "rgba(245, 158, 11, 0.45)"
             : isMajor
-            ? "rgba(6, 182, 214, 0.28)"
-            : "rgba(99, 102, 241, 0.12)";
+              ? "rgba(6, 182, 214, 0.28)"
+              : "rgba(99, 102, 241, 0.12)";
           ctx.lineWidth = isCenter ? 2 : isMajor ? 1.5 : 1;
 
           ctx.beginPath();
@@ -166,6 +170,10 @@ export function CyberBackground({ variant = "login" }) {
             const tailX = vanishingX + st.lane * (w * 0.8) * Math.pow(tailDepth, 1.8);
 
             const alpha = Math.min(1, depthProgress * 1.8) * 0.7;
+            if (![tailX, tailY, startX, startY, alpha].every(Number.isFinite)) {
+              st.z = 1000;
+              return;
+            }
             const grad = ctx.createLinearGradient(tailX, tailY, startX, startY);
             grad.addColorStop(0, `${st.color}0)`);
             grad.addColorStop(1, `${st.color}${alpha})`);
@@ -365,7 +373,7 @@ export function CyberBackground({ variant = "login" }) {
         pointerEvents: "none",
         width: "100%",
         height: "100%",
-        display: "block",
+        display: "none",
       }}
     />
   );

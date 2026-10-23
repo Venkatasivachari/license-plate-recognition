@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import time
 from typing import Iterable
 
 from plate_validator import validate_plate
@@ -23,6 +24,48 @@ class OCRSummary:
     confidence: float
     consensus: int
     attempts: int
+
+
+class PlateConsensus:
+    """Require repeated format-valid reads for the same tracked vehicle."""
+
+    def __init__(self, minimum_votes: int = 2, window_seconds: float = 30.0, max_tracks: int = 512) -> None:
+        self.minimum_votes = max(1, minimum_votes)
+        self.window_seconds = max(1.0, window_seconds)
+        self.max_tracks = max(1, max_tracks)
+        self._reads: dict[str, list[tuple[float, OCRAttempt]]] = {}
+
+    def add(self, track_key: str, attempt: OCRAttempt, now: float | None = None) -> OCRSummary | None:
+        if not track_key or not attempt.plate or attempt.confidence <= 0:
+            return None
+
+        validation = validate_plate(attempt.plate)
+        if not validation["valid"]:
+            return None
+
+        timestamp = time.monotonic() if now is None else now
+        reads = self._reads.setdefault(track_key, [])
+        cutoff = timestamp - self.window_seconds
+        reads[:] = [(seen_at, read) for seen_at, read in reads if seen_at >= cutoff]
+        normalized_attempt = OCRAttempt(attempt.raw_text, validation["plate"], attempt.confidence)
+        if reads and reads[-1][1].plate != normalized_attempt.plate:
+            reads.clear()
+        reads.append((timestamp, normalized_attempt))
+
+        if len(self._reads) > self.max_tracks:
+            oldest_key = min(self._reads, key=lambda key: self._reads[key][-1][0] if self._reads[key] else 0)
+            if oldest_key != track_key:
+                del self._reads[oldest_key]
+
+        grouped: dict[str, list[OCRAttempt]] = defaultdict(list)
+        for _, read in reads:
+            grouped[read.plate].append(read)
+        plate, group = max(grouped.items(), key=lambda item: (len(item[1]), max(read.confidence for read in item[1])))
+        if len(group) < self.minimum_votes:
+            return None
+
+        best = max(group, key=lambda read: read.confidence)
+        return OCRSummary(best.raw_text, plate, best.confidence, len(group), len(reads))
 
 
 def summarize_ocr(attempts: Iterable[OCRAttempt]) -> OCRSummary:

@@ -51,10 +51,77 @@ async function apiFetch(path, options = {}, attempt = 0) {
   return response.json();
 }
 
+function ensureDemoAdminAccount() {
+  const existing = read("accounts").find((account) => account.id === "ACC-ADMIN");
+  if (existing) return existing;
+
+  const admin = {
+    id: "ACC-ADMIN",
+    username: "admin",
+    password: "admin123",
+    role: "ADMIN",
+    displayName: "System Admin",
+    email: "admin@nexplate.internal",
+    plateNumber: null,
+    source: "DEMO",
+    createdAt: new Date().toISOString(),
+  };
+
+  write("accounts", [admin, ...read("accounts")]);
+  return admin;
+}
+
+function resolveDemoLogin(username, password, role) {
+  const normalizedUsername = String(username || "").trim();
+  const normalizedPassword = String(password || "").trim();
+  if (!normalizedUsername || !normalizedPassword) return null;
+
+  const admin = ensureDemoAdminAccount();
+  if (role === "ADMIN") {
+    const matchesAdmin = normalizedUsername.toLowerCase() === admin.username.toLowerCase() || normalizedUsername.toLowerCase() === admin.email.toLowerCase();
+    if (matchesAdmin && normalizedPassword === admin.password) {
+      return {
+        id: admin.id,
+        role: admin.role,
+        display_name: admin.displayName,
+        plate_number: admin.plateNumber || null,
+        email: admin.email,
+      };
+    }
+  }
+
+  const account = read("accounts").find((entry) => entry.role === role && entry.username.toUpperCase() === normalizedUsername.toUpperCase() && entry.password === normalizedPassword);
+  if (account) {
+    return {
+      id: account.id,
+      role: account.role,
+      display_name: account.displayName || account.username,
+      plate_number: account.plateNumber || null,
+      email: account.email || null,
+    };
+  }
+
+  return null;
+}
+
 export async function apiLogin(username, password, role) {
-  const data = await apiFetch("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password, role }) });
-  setSession(data);
-  return data;
+  try {
+    const data = await apiFetch("/api/auth/login", { method: "POST", body: JSON.stringify({ username, password, role }) });
+    setSession(data);
+    return data;
+  } catch (error) {
+    const demoUser = resolveDemoLogin(username, password, role);
+    if (demoUser) {
+      const demoSession = {
+        access_token: "demo-access-token",
+        refresh_token: "demo-refresh-token",
+        user: demoUser,
+      };
+      setSession(demoSession);
+      return demoSession;
+    }
+    throw error;
+  }
 }
 
 export function apiLogout() { setSession(null); return true; }
@@ -71,7 +138,12 @@ const demoVehicles = Array.from({ length: 30 }, (_, index) => ({
 }));
 
 export function seedDemoData() {
-  if (!localStorage.getItem("settings")) write("settings", [{ id: "settings", cameraEnabled: false, demoMode: false }]);
+  const existingSettings = read("settings");
+  if (!existingSettings.length) write("settings", [{ id: "settings", cameraEnabled: false, demoMode: true }]);
+  else write("settings", [{ ...existingSettings[0], demoMode: true, cameraEnabled: false }]);
+
+  ensureDemoAdminAccount();
+
   for (const key of ["vehicles", "permissions", "invitations", "visits", "detections", "alerts"]) { const records = read(key); const normalized = records.map(normalizeRecordPlate); if (JSON.stringify(records) !== JSON.stringify(normalized)) write(key, normalized); }
 }
 export function generateSampleData(amount = 30) {
@@ -271,7 +343,8 @@ export async function createInvitation(item) {
       write("invitations", [mapped, ...read("invitations")]);
       return read("invitations");
     } catch (error) {
-      console.error("Failed to create invitation via API, falling back to localStorage:", error);
+      console.error("Failed to create invitation via API:", error);
+      throw error;
     }
   }
   return create("invitations", item);
@@ -298,6 +371,7 @@ export async function markAlertRead(id) {
       await apiFetch(`/api/alerts/${id}/read`, { method: "POST" });
     } catch (error) {
       console.error("Failed to mark alert as read via API:", error);
+      throw error;
     }
   }
   write("alerts", read("alerts").map((alert) => alert.id === id ? { ...alert, read: true } : alert));
@@ -502,7 +576,7 @@ export async function updateComplaintStatus(id, status, adminResponse = "") {
 export async function syncBackendData() {
   if (!getAccessToken()) throw new Error("Not authenticated");
   const results = {};
-  const safeFetch = async (key, path) => { try { results[key] = await apiFetch(path); } catch { results[key] = []; } };
+  const safeFetch = async (key, path) => { try { results[key] = await apiFetch(path); } catch (error) { console.error(`Failed to sync ${key} from API:`, error); } };
   const requests = [
     safeFetch("vehicles", "/api/vehicles"),
     safeFetch("detections", "/api/events?limit=1000"),
@@ -515,16 +589,13 @@ export async function syncBackendData() {
   if (getSession()?.user?.role === "ADMIN") requests.push(safeFetch("passwordResetRequests", "/api/password-reset/requests"));
   await Promise.all(requests);
   const merge = (key, records) => {
-    const existing = read(key);
-    const byId = new Map(existing.map((item) => [item.id, item]));
-    (records || []).forEach((item) => {
-      if (!item.id) return;
-      const normalized = { ...item, plateNumber: item.plateNumber || item.plate_number };
-      byId.set(normalized.id, { ...byId.get(normalized.id), ...normalized, source: normalized.source || "REAL", demoData: false });
-    });
-    const serverIds = new Set((records || []).map((item) => item.id).filter(Boolean));
-    const demoRecords = existing.filter((item) => (item.demoData || item.source === "DEMO") && !serverIds.has(item.id));
-    write(key, [...demoRecords, ...(records || []).map((item) => byId.get(item.id) || item)].sort((left, right) => new Date(right.timestamp || right.entryTime || right.startAt || right.createdAt || 0) - new Date(left.timestamp || left.entryTime || left.startAt || left.createdAt || 0)));
+    if (!Object.hasOwn(results, key)) return;
+    const authoritative = (records || []).map((item) => ({
+      ...normalizeRecordPlate({ ...item, plateNumber: item.plateNumber || item.plate_number }),
+      source: item.source || "REAL",
+      demoData: false,
+    }));
+    write(key, authoritative.sort((left, right) => new Date(right.timestamp || right.detected_at || right.entryTime || right.entry_time || right.startAt || right.createdAt || 0) - new Date(left.timestamp || left.detected_at || left.entryTime || left.entry_time || left.startAt || left.createdAt || 0)));
   };
   for (const key of Object.keys(results)) merge(key, results[key]);
   return results;

@@ -5,15 +5,31 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+from ultralytics import YOLO
+
+from config import PLATE_CONFIDENCE_THRESHOLD, PLATE_INFERENCE_SIZE, PLATE_MODEL_PATH
 
 
 class PlateDetector:
     """Detects license plate regions in a vehicle image."""
 
-    def __init__(self) -> None:
+    def __init__(self, model_path: Optional[str | Path] = None) -> None:
         self.project_root = Path(__file__).resolve().parent.parent
+        self.model_path = Path(model_path) if model_path else PLATE_MODEL_PATH
+        self.model = YOLO(str(self.model_path)) if self.model_path.is_file() else None
 
     def detect_plate_candidates(self, vehicle_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        if self.model is not None:
+            results = self.model.predict(vehicle_image, conf=PLATE_CONFIDENCE_THRESHOLD, imgsz=PLATE_INFERENCE_SIZE, verbose=False)
+            detections = []
+            for result in results:
+                for box in result.boxes:
+                    coordinates = tuple(map(int, box.xyxy[0].tolist()))
+                    detections.append((coordinates, float(box.conf[0])))
+            if detections:
+                detections.sort(key=lambda detection: detection[1], reverse=True)
+                return [box for box, _ in detections[:5]]
+
         gray = cv2.cvtColor(vehicle_image, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blur, 50, 150)

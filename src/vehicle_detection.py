@@ -7,6 +7,8 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from config import TRACKING_ENABLED, VEHICLE_TRACKER
+
 
 class VehicleDetector:
     """Detects vehicles in frames using a YOLO model."""
@@ -20,7 +22,10 @@ class VehicleDetector:
         self.model = YOLO(str(model_path) if model_path else str(default_model))
 
     def detect(self, image: np.ndarray, conf_threshold: float = 0.25) -> List[dict]:
-        results = self.model(image, conf=conf_threshold, verbose=False)
+        if TRACKING_ENABLED:
+            results = self.model.track(image, conf=conf_threshold, tracker=VEHICLE_TRACKER, persist=True, verbose=False)
+        else:
+            results = self.model(image, conf=conf_threshold, verbose=False)
         detections: List[dict] = []
 
         for result in results:
@@ -29,6 +34,7 @@ class VehicleDetector:
                 conf = float(box.conf[0])
                 cls_id = int(box.cls[0])
                 class_name = result.names.get(cls_id, "vehicle")
+                track_id = int(box.id[0]) if box.id is not None else None
 
                 if class_name.lower() in {"car", "motorcycle", "bus", "truck", "bicycle"}:
                     detections.append(
@@ -36,6 +42,7 @@ class VehicleDetector:
                             "bbox": (x1, y1, x2, y2),
                             "confidence": conf,
                             "class_name": class_name,
+                            "track_id": track_id,
                         }
                     )
 

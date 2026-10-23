@@ -16,6 +16,7 @@
     "motion": "^13.2.0",
     "react": "latest",
     "react-dom": "latest",
+    "react-router-dom": "^7.18.4",
     "vite": "latest",
     "xlsx": "^0.18.5",
     "xlsx-js-style": "^1.2.0"
