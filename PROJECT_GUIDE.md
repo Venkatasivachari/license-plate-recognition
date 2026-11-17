@@ -44,7 +44,7 @@ LPRS detects vehicles and license plates, reads registration text, applies forma
 - Plate cropping and OCR using EasyOCR; preprocessing and candidate crops help select a readable result.
 - Plate text normalization to uppercase alphanumeric characters and format validation.
 - Confidence and format signals are passed with events so uncertain reads can be reviewed rather than treated as proof of unauthorized access.
-- Configurable model path, camera index, detector/OCR thresholds, and demo allow/deny plate sets through [`src/config.py`](src/config.py).
+- Configurable model path, camera index, detector/OCR thresholds through [`src/config.py`](src/config.py). OCR recognition does not decide access; the backend performs the database lookup.
 - Separate utilities for dataset preparation, XML-to-YOLO conversion, annotation review, training, OCR evaluation, and model smoke tests.
 
 ### Operations dashboard
@@ -120,7 +120,7 @@ If Supabase is not configured, the backend has an in-memory event fallback for l
 
 ### Standalone camera and hardware prototype
 
-[`src/live_lprs.py`](src/live_lprs.py) is a separate OpenCV live-camera prototype. It can use an Arduino-compatible serial board for a buzzer; the documented commands are byte `1` to turn on and byte `0` to turn off. The interactive controls include `O` to switch off and `Q` to quit. Camera, serial hardware, firmware, and physical buzzer timing must be tested on the target equipment. This path is distinct from the browser-camera/API workflow.
+[`src/live_lprs.py`](src/live_lprs.py) uses the same service-authenticated backend event endpoint as the Python AI service; it no longer has a local authorized-plate list. `src/lprs_controller.py` requires two matching manual reads before requesting an access decision. Both use the backend `SERVICE_TOKEN` and fail closed if the API/database cannot return a decision. The Arduino signal is still only a prototype buzzer signal, not a gate actuator; test camera, serial hardware, firmware, and buzzer timing on target equipment.
 
 ## Access decision rules
 
@@ -159,8 +159,9 @@ The dependency list is in [`requirements.txt`](requirements.txt). It includes Op
 1. Create a Supabase project.
 2. In its SQL Editor, run [`supabase/schema.sql`](supabase/schema.sql).
 3. Then run [`supabase/migrations/20260911_enhance_invitations_permissions.sql`](supabase/migrations/20260911_enhance_invitations_permissions.sql).
-4. Create/configure Auth users with `ADMIN` or `CUSTOMER` role metadata as appropriate.
-5. Configure the backend using [`backend/.env.example`](backend/.env.example). The service-role key belongs on the backend only.
+4. Run [`supabase/migrations/20261104_production_auth_hardening.sql`](supabase/migrations/20261104_production_auth_hardening.sql); resolve its guarded plaintext-password check before retrying if it stops.
+5. Create/configure Auth users with `ADMIN` or `CUSTOMER` role metadata as appropriate.
+6. Configure the backend using [`backend/.env.example`](backend/.env.example). The service-role key belongs on the backend only.
 
 Detailed Supabase notes are in [`SUPABASE_SETUP.md`](SUPABASE_SETUP.md). Database SQL must be applied to the Supabase project; merely having the SQL file in the repository does not deploy it.
 
@@ -170,11 +171,11 @@ Copy examples to local `.env` files and fill in secrets locally. `.env` files ar
 
 | File | Important settings |
 |---|---|
-| [`.env.example`](.env.example) | `LPRS_AI_PORT`, `LPRS_BACKEND_URL`, `LPRS_MODEL_PATH`, camera/threshold/plate settings, and the OpenAI-compatible `OMNIROUTE_BASE_URL` / `OMNIROUTE_API_KEY` used by the AI module's review client. |
-| [`backend/.env.example`](backend/.env.example) | `PORT`, `SUPABASE_URL`, backend-only `SUPABASE_SERVICE_ROLE_KEY`, and `SERVICE_TOKEN`. |
+| [`.env.example`](.env.example) | `LPRS_AI_PORT`, `LPRS_AI_HOST`, `LPRS_AI_ALLOWED_ORIGINS`, `LPRS_BACKEND_URL`, `LPRS_ACCESS_URL`, `LPRS_MODEL_PATH`, and optional `LPRS_AI_TOKEN` (same secret as backend `SERVICE_TOKEN`). |
+| [`backend/.env.example`](backend/.env.example) | `PORT`, `SUPABASE_URL`, backend-only `SUPABASE_SERVICE_ROLE_KEY`, `SERVICE_TOKEN`, and server-side OCR quality thresholds. |
 | `frontend/.env` (create locally) | `VITE_API_URL=http://localhost:4000` and `VITE_AI_URL=http://localhost:5001`. |
 
-Never put a service-role key, service token, or provider API key in frontend environment variables or commit them. The Python service reads its project-root `.env`; the Node backend reads its backend `.env` when started from the backend directory.
+Never put a service-role key, service token, or provider API key in frontend environment variables or commit them. The Python service reads its project-root `.env`; the standalone access client also reads `backend/.env` for `SERVICE_TOKEN` when `LPRS_AI_TOKEN` is not set. The Node backend reads its backend `.env` when started from the backend directory.
 
 ### Useful Python settings
 
@@ -182,15 +183,15 @@ Never put a service-role key, service token, or provider API key in frontend env
 |---|---|---|
 | `LPRS_AI_PORT` | `5001` | Python HTTP service port. |
 | `LPRS_BACKEND_URL` | `http://localhost:4000/api/events` | Event destination. |
+| `LPRS_ACCESS_URL` | `http://localhost:4000/api/access/events` | Authenticated event/access endpoint used by standalone hardware clients. |
 | `LPRS_MODEL_PATH` | Configured trained weights path | Override the plate model. |
 | `LPRS_CAMERA_INDEX` | `0` | OpenCV camera index for standalone mode. |
 | `LPRS_YOLO_CONFIDENCE` | `0.25` | Detection confidence threshold. |
 | `LPRS_OCR_CONFIDENCE` | `0.30` | OCR confidence threshold. |
+| `LPRS_OCR_CONSENSUS_FRAMES` | `2` | Minimum matching reads required by the backend event endpoint; keep aligned with the Python service. |
 | `LPRS_SERIAL_PORT` | `COM6` | Standalone Arduino serial port. |
 | `LPRS_BAUD_RATE` | `9600` | Serial speed. |
 | `LPRS_BUZZER_SECONDS` | `5` | Standalone buzzer duration. |
-| `LPRS_AUTHORIZED_PLATES` | Demo plate list | Comma-separated development allowlist. |
-| `LPRS_UNAUTHORIZED_PLATES` | Demo plate list | Comma-separated development denylist. |
 
 ## Run the connected dashboard
 
@@ -247,6 +248,7 @@ When Supabase is configured, send `Authorization: Bearer <access-token>` to prot
 | `GET` / `POST` | `/api/permissions` | List/create permissions; creation is admin-only. |
 | `PATCH` | `/api/permissions/:id/status` | Change permission status; admin-only. |
 | `GET` / `POST` | `/api/events` | Read detections / submit a detection; writes require admin or service role. |
+| `POST` | `/api/access/events` | Store a trusted hardware OCR event, evaluate authorization against Supabase, and return the database decision; service token required. |
 | `GET` | `/api/visits` | Read visit history, scoped to the account. |
 | `GET` / `POST` | `/api/alerts`, `/api/alerts/:id/read` | List alerts and acknowledge one. |
 | `GET` | `/api/analytics/dashboard` | Dashboard counts; admin-only. |
@@ -284,9 +286,11 @@ Useful repository checks include:
 ```powershell
 python -m compileall -q src
 python src\test_lprs_runtime.py -q
+python src\test_backend_access.py -q
 python src\test_validator.py
 python src\test_vehicle_database.py
-npm run build --prefix frontend
+npm --prefix backend test
+npm --prefix frontend run build
 ```
 
 Additional smoke scripts are listed under [`src/`](src/). Hardware-dependent tests require a camera/serial device; OCR/detection quality requires representative labeled images. Passing unit/build checks does not validate end-to-end accuracy, Supabase deployment, or physical access-control behavior.
@@ -295,7 +299,7 @@ Additional smoke scripts are listed under [`src/`](src/). Hardware-dependent tes
 
 - Keep Supabase service-role keys and service tokens in backend-only local environment files. Never publish actual credentials.
 - The repository's dataset contains visible license plates; treat those images as potentially identifying information.
-- Use HTTPS and trusted origins for deployment. The Python frame service currently permits cross-origin requests and should not be exposed directly to an untrusted network without additional controls.
+- Use HTTPS and trusted origins for deployment. The Python frame service restricts browser origins but should not be exposed directly to an untrusted network without additional controls.
 - Do not treat an OCR miss as an unauthorized decision. Use an operator review path for uncertain reads.
 - Current plate-format validation covers only selected Indian formats; false reads and unsupported registrations are possible.
 - This codebase does not provide a complete production threat model, calibrated recognition accuracy, robust multi-camera tracking, guaranteed evidence capture, or verified Arduino firmware/wiring.

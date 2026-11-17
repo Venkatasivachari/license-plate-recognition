@@ -2,14 +2,30 @@ const keys = ["vehicles", "owners", "drivers", "permissions", "invitations", "vi
 const read = (key) => JSON.parse(localStorage.getItem(key) || "[]");
 const write = (key, value) => { localStorage.setItem(key, JSON.stringify(value)); window.dispatchEvent(new Event("local-data-change")); return value; };
 export const normalizePlate = (value) => String(value || "").replace(/[^A-Z0-9]/gi, "").toUpperCase().slice(0, 10);
-export const isIndianPlateFormat = (value) => /^(AP|AR|AS|BR|CG|DL|GA|GJ|HR|HP|JK|JH|KA|KL|MP|MH|MN|OD|PB|RJ|SK|TN|TS|TR|UP|UK|WB)\d{1,2}[A-Z]{1,3}\d{1,4}$/.test(normalizePlate(value));
+export const isIndianPlateFormat = (value) => {
+  const p = normalizePlate(value);
+  if (!p || p.length < 5 || p.length > 10) return false;
+  if (/^\d{2}BH\d{4}[A-Z]{1,2}$/.test(p)) return true;
+  return /^(AN|AP|AR|AS|BH|BR|CG|CH|DD|DL|DN|GA|GJ|HR|HP|JH|JK|KA|KL|LA|LD|MP|MH|MN|ML|MZ|NL|OD|PB|PY|RJ|SK|TN|TS|TR|UP|UK|UA|WB)\d{1,2}[A-Z]{0,3}\d{1,4}$/.test(p);
+};
 const normalizeRecordPlate = (value) => value && value.plateNumber ? { ...value, plateNumber: normalizePlate(value.plateNumber), ...(value.ownerPlateNumber ? { ownerPlateNumber: normalizePlate(value.ownerPlateNumber) } : {}) } : value;
 const create = (key, value) => { const item = { id: `${key.slice(0, 2).toUpperCase()}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, createdAt: new Date().toISOString(), ...normalizeRecordPlate(value) }; return write(key, [item, ...read(key)]); };
 
 const API_BASE = (typeof import.meta !== "undefined" && import.meta.env?.VITE_API_URL) || "http://localhost:4000";
+const localDemoEnabled = import.meta.env.DEV && import.meta.env.VITE_DEMO_MODE === "true";
 
-let session = null;
-export const setSession = (value) => { session = value || null; };
+let session = (() => {
+  try {
+    return JSON.parse(sessionStorage.getItem("nexplate-session") || "null");
+  } catch {
+    return null;
+  }
+})();
+export const setSession = (value) => {
+  session = value || null;
+  if (session) sessionStorage.setItem("nexplate-session", JSON.stringify(session));
+  else sessionStorage.removeItem("nexplate-session");
+};
 export const getSession = () => session;
 export const getAccessToken = () => session?.access_token || null;
 export const getRefreshToken = () => session?.refresh_token || null;
@@ -29,7 +45,7 @@ async function tryRefresh() {
     const response = await fetch(`${API_BASE}/api/auth/refresh`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ refresh_token: refreshToken }) });
     if (!response.ok) { setSession(null); return false; }
     const data = await response.json();
-    session = { ...session, access_token: data.access_token, refresh_token: data.refresh_token };
+    setSession({ ...session, access_token: data.access_token, refresh_token: data.refresh_token });
     return true;
   } catch {
     return false;
@@ -51,44 +67,10 @@ async function apiFetch(path, options = {}, attempt = 0) {
   return response.json();
 }
 
-function ensureDemoAdminAccount() {
-  const existing = read("accounts").find((account) => account.id === "ACC-ADMIN");
-  if (existing) return existing;
-
-  const admin = {
-    id: "ACC-ADMIN",
-    username: "admin",
-    password: "admin123",
-    role: "ADMIN",
-    displayName: "System Admin",
-    email: "admin@nexplate.internal",
-    plateNumber: null,
-    source: "DEMO",
-    createdAt: new Date().toISOString(),
-  };
-
-  write("accounts", [admin, ...read("accounts")]);
-  return admin;
-}
-
 function resolveDemoLogin(username, password, role) {
   const normalizedUsername = String(username || "").trim();
   const normalizedPassword = String(password || "").trim();
   if (!normalizedUsername || !normalizedPassword) return null;
-
-  const admin = ensureDemoAdminAccount();
-  if (role === "ADMIN") {
-    const matchesAdmin = normalizedUsername.toLowerCase() === admin.username.toLowerCase() || normalizedUsername.toLowerCase() === admin.email.toLowerCase();
-    if (matchesAdmin && normalizedPassword === admin.password) {
-      return {
-        id: admin.id,
-        role: admin.role,
-        display_name: admin.displayName,
-        plate_number: admin.plateNumber || null,
-        email: admin.email,
-      };
-    }
-  }
 
   const account = read("accounts").find((entry) => entry.role === role && entry.username.toUpperCase() === normalizedUsername.toUpperCase() && entry.password === normalizedPassword);
   if (account) {
@@ -110,6 +92,7 @@ export async function apiLogin(username, password, role) {
     setSession(data);
     return data;
   } catch (error) {
+    if (!localDemoEnabled) throw error;
     const demoUser = resolveDemoLogin(username, password, role);
     if (demoUser) {
       const demoSession = {
@@ -138,13 +121,16 @@ const demoVehicles = Array.from({ length: 30 }, (_, index) => ({
 }));
 
 export function seedDemoData() {
-  const existingSettings = read("settings");
-  if (!existingSettings.length) write("settings", [{ id: "settings", cameraEnabled: false, demoMode: true }]);
-  else write("settings", [{ ...existingSettings[0], demoMode: true, cameraEnabled: false }]);
-
-  ensureDemoAdminAccount();
-
-  for (const key of ["vehicles", "permissions", "invitations", "visits", "detections", "alerts"]) { const records = read(key); const normalized = records.map(normalizeRecordPlate); if (JSON.stringify(records) !== JSON.stringify(normalized)) write(key, normalized); }
+  if (localDemoEnabled) {
+    const existingSettings = read("settings");
+    if (!existingSettings.length) write("settings", [{ id: "settings", cameraEnabled: false, demoMode: true }]);
+    else write("settings", [{ ...existingSettings[0], demoMode: true, cameraEnabled: false }]);
+  }
+  for (const key of ["vehicles", "permissions", "invitations", "visits", "detections", "alerts"]) {
+    const records = read(key);
+    const normalized = records.map(normalizeRecordPlate);
+    if (JSON.stringify(records) !== JSON.stringify(normalized)) write(key, normalized);
+  }
 }
 export function generateSampleData(amount = 30) {
   const count = Math.max(1, Math.min(Number(amount) || 30, 100));
@@ -156,7 +142,7 @@ export function generateSampleData(amount = 30) {
   write("alerts", [...generated.filter((vehicle) => ["BLOCKED", "EXPIRED"].includes(vehicle.status)).map((vehicle, index) => ({ id: `ALT-${stamp}-${index}`, plateNumber: vehicle.plateNumber, type: vehicle.status, message: `${vehicle.status} sample vehicle requires review`, read: false, source: "DEMO", timestamp: vehicle.createdAt })), ...read("alerts")]);
   return generated;
 }
-export function clearDemoData() { for (const key of ["vehicles", "visits", "detections", "alerts", "permissions", "invitations", "accounts"]) write(key, read(key).filter((item) => item.id === "ACC-ADMIN" || (item.source !== "DEMO" && !item.demoData))); }
+export function clearDemoData() { for (const key of ["vehicles", "visits", "detections", "alerts", "permissions", "invitations", "accounts"]) write(key, read(key).filter((item) => item.source !== "DEMO" && !item.demoData)); }
 export const getCollection = (key) => read(key);
 
 // ============================================================
@@ -175,6 +161,28 @@ export async function fetchCollectionFromAPI(key) {
     console.error(`Failed to fetch ${key} from API:`, error);
     return read(key);
   }
+}
+
+export async function fetchCustomerPortalData() {
+  if (!getAccessToken()) throw ApiError(401, "Your session has expired. Please sign in again.");
+  const healthResponse = await fetch(`${API_BASE}/health`);
+  if (!healthResponse.ok) throw new Error("The database service is unavailable. Customer data could not be loaded.");
+  const health = await healthResponse.json();
+  if (health.database?.connected !== true || health.database?.status !== "CONNECTED") {
+    throw new Error("The database is not connected. Customer data is unavailable until the database connection is restored.");
+  }
+  const [vehicles, invitations, visits, detections, alerts, complaints] = await Promise.all([
+    apiFetch("/api/vehicles"),
+    apiFetch("/api/invitations"),
+    apiFetch("/api/visits?limit=1000"),
+    apiFetch("/api/events?limit=1000"),
+    apiFetch("/api/alerts?limit=1000"),
+    apiFetch("/api/complaints"),
+  ]);
+  if (![vehicles, invitations, visits, detections, alerts, complaints].every(Array.isArray)) {
+    throw new Error("The database returned an invalid customer data response. Please retry.");
+  }
+  return { vehicles, invitations, visits, detections, alerts, complaints };
 }
 
 // ============================================================
@@ -479,21 +487,18 @@ export const getVehicleStats = (plate) => { const history = getCustomerHistorySy
 // PASSWORD RESET - API-first
 // ============================================================
 export async function requestPasswordReset(payload) {
-  if (getAccessToken()) {
-    try {
-      const data = await apiFetch("/api/password-reset/request", { method: "POST", body: JSON.stringify({ plateNumber: normalizePlate(payload.plateNumber), ownerName: payload.ownerName }) });
-      write("passwordResetRequests", [data, ...read("passwordResetRequests")]);
-      return data;
-    } catch (error) {
-      console.error("Failed to request password reset via API:", error);
-      throw error;
-    }
+  try {
+    const data = await apiFetch("/api/password-reset/request", { method: "POST", body: JSON.stringify({ plateNumber: normalizePlate(payload.plateNumber), ownerName: payload.ownerName }) });
+    write("passwordResetRequests", [data, ...read("passwordResetRequests")]);
+    return data;
+  } catch (error) {
+    console.error("Failed to request password reset via API:", error);
+    throw error;
   }
-  throw new Error("Authentication required for password reset");
 }
 
 export async function resetAdminPassword(payload) {
-  const data = await apiFetch("/api/auth/admin-password-reset", { method: "POST", body: JSON.stringify({ adminId: payload.adminId, displayName: payload.displayName, newPassword: payload.newPassword }) });
+  const data = await apiFetch("/api/auth/admin-password-reset", { method: "POST", body: JSON.stringify({ adminId: payload.adminId, displayName: payload.displayName }) });
   return data;
 }
 
@@ -602,4 +607,3 @@ export async function syncBackendData() {
 }
 
 export { demoVehicles, keys, purposes, types };
-

@@ -133,11 +133,18 @@ def classify_plate(
 def build_detection_event(
     summary: OCRSummary,
     vehicle_class: str,
-    authorized_plates: set[str],
+    authorized_plates: set[str] | None,
     minimum_confidence: float,
 ) -> dict:
-    """Create the stable, JSON-friendly payload sent to dashboard clients."""
-    state, details = classify_plate(summary, authorized_plates, minimum_confidence)
+    """Create a detection payload, deferring access decisions when no allowlist is supplied."""
+    state, details = classify_plate(summary, authorized_plates or set(), minimum_confidence)
+    if authorized_plates is None and state == "UNAUTHORIZED":
+        state = "RECOGNIZED"
+        details = {
+            **details,
+            "decision": "UNKNOWN",
+            "reason": "OCR accepted; authorization requires a backend lookup",
+        }
     validation = details.get("validation", {})
     return {
         "event": "vehicle_detected",

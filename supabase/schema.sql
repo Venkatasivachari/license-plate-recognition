@@ -220,7 +220,6 @@ create table if not exists public.password_reset_requests (
   customer_id uuid not null references auth.users(id) on delete cascade,
   plate_number text not null,
   owner_name text not null,
-  new_password text,
   status text not null default 'PENDING' check (status in ('PENDING', 'APPROVED', 'REJECTED')),
   resolved_by uuid references auth.users(id) on delete set null,
   resolved_at timestamptz,
@@ -318,7 +317,7 @@ $$;
 create or replace function public.handle_new_user() returns trigger language plpgsql security definer set search_path = public as $$
 begin
   insert into public.profiles (id, display_name, role, plate_number)
-  values (new.id, coalesce(new.raw_user_meta_data->>'display_name', new.email), coalesce(new.raw_user_meta_data->>'role', 'CUSTOMER'), new.raw_user_meta_data->>'plate_number');
+  values (new.id, coalesce(new.raw_user_meta_data->>'display_name', new.email), 'CUSTOMER', new.raw_user_meta_data->>'plate_number');
   return new;
 end;
 $$;
@@ -428,7 +427,7 @@ create policy "admins manage permissions" on public.permissions
   for all using (public.is_admin()) with check (public.is_admin());
 
 create policy "service insert permissions" on public.permissions
-  for insert with check (true);
+  for insert with check (auth.role() = 'service_role');
 
 -- ============================================================
 -- RLS POLICIES: detections
@@ -446,7 +445,7 @@ create policy "customers read own detections" on public.detections
   );
 
 create policy "service insert detections" on public.detections
-  for insert with check (true);
+  for insert with check (auth.role() = 'service_role');
 
 -- ============================================================
 -- RLS POLICIES: visits
@@ -464,10 +463,10 @@ create policy "customers read own visits" on public.visits
   );
 
 create policy "service insert visits" on public.visits
-  for insert with check (true);
+  for insert with check (auth.role() = 'service_role');
 
 create policy "service update visits" on public.visits
-  for update using (true) with check (true);
+  for update using (auth.role() = 'service_role') with check (auth.role() = 'service_role');
 
 -- ============================================================
 -- RLS POLICIES: vehicle_sessions
@@ -485,10 +484,10 @@ create policy "customers read own vehicle sessions" on public.vehicle_sessions
   );
 
 create policy "service insert sessions" on public.vehicle_sessions
-  for insert with check (true);
+  for insert with check (auth.role() = 'service_role');
 
 create policy "service update sessions" on public.vehicle_sessions
-  for update using (true) with check (true);
+  for update using (auth.role() = 'service_role') with check (auth.role() = 'service_role');
 
 -- ============================================================
 -- RLS POLICIES: evidence
@@ -507,7 +506,7 @@ create policy "customers read own vehicle evidence" on public.evidence
   );
 
 create policy "service insert evidence" on public.evidence
-  for insert with check (true);
+  for insert with check (auth.role() = 'service_role');
 
 -- ============================================================
 -- RLS POLICIES: alerts
@@ -526,7 +525,7 @@ create policy "customers read own alerts" on public.alerts
   );
 
 create policy "service insert alerts" on public.alerts
-  for insert with check (true);
+  for insert with check (auth.role() = 'service_role');
 
 -- ============================================================
 -- RLS POLICIES: password_reset_requests
@@ -559,7 +558,7 @@ create policy "admins read audit logs" on public.audit_logs
   for select using (public.is_admin());
 
 create policy "service insert audit logs" on public.audit_logs
-  for insert with check (true);
+  for insert with check (auth.role() = 'service_role');
 
 -- ============================================================
 -- 31-DAY RETENTION CLEANUP FUNCTION
@@ -574,6 +573,9 @@ begin
   delete from public.evidence where created_at < now() - interval '31 days';
 end;
 $$;
+
+revoke all on function public.cleanup_old_records() from public, anon, authenticated;
+grant execute on function public.cleanup_old_records() to service_role;
 
 -- ============================================================
 -- REALTIME PUBLICATION

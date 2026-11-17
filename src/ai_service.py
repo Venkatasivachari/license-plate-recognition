@@ -13,7 +13,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import openai
 from dotenv import load_dotenv
 
 SRC_DIR = Path(__file__).resolve().parent
@@ -24,21 +23,15 @@ from plate_validator import validate_plate
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-client = openai.OpenAI(
-    base_url=os.getenv("OMNIROUTE_BASE_URL", "http://localhost:20128/v1"),
-    api_key=os.getenv("OMNIROUTE_API_KEY"),
-)
-
-from config import AUTHORIZED_PLATES, OCR_CONFIDENCE_THRESHOLD, OCR_CONSENSUS_FRAMES, OCR_CONSENSUS_WINDOW_SECONDS, PLATE_MIN_WIDTH_PIXELS, UNAUTHORIZED_PLATES, VEHICLE_MODEL_PATH, YOLO_CONFIDENCE_THRESHOLD  # noqa: E402
+from config import OCR_CONFIDENCE_THRESHOLD, OCR_CONSENSUS_FRAMES, OCR_CONSENSUS_WINDOW_SECONDS, PLATE_MIN_WIDTH_PIXELS, VEHICLE_MODEL_PATH, YOLO_CONFIDENCE_THRESHOLD  # noqa: E402
 from lprs_runtime import OCRAttempt, PlateConsensus, build_detection_event  # noqa: E402
 _ocr_startup_started = time.perf_counter()
-from ocr import read_plate  # noqa: E402
+from ocr import analyze_plate_styling, read_plate  # noqa: E402
 OCR_STARTUP_MS = round((time.perf_counter() - _ocr_startup_started) * 1000, 1)
 from plate_detection import PlateDetector  # noqa: E402
 from vehicle_detection import VehicleDetector  # noqa: E402
 
 BACKEND_URL = os.getenv("LPRS_BACKEND_URL", "http://localhost:4000/api/events")
-PAPER_TEST_MODE = os.getenv("LPRS_PAPER_TEST", "false").lower() == "true"
 _detector = None
 _vehicle_model_load_ms = None
 _plate_model_load_started = time.perf_counter()
@@ -63,23 +56,15 @@ def _load_dotenv_values(path):
 
 
 SERVICE_TOKEN = os.getenv("LPRS_AI_TOKEN") or _load_dotenv_values(SRC_DIR.parent / "backend" / ".env").get("SERVICE_TOKEN", "")
-
-
-def review_uncertain_plate(ocr_text: str, confidence: float) -> str:
-    response = client.chat.completions.create(
-        model="auto/best-coding",
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"OCR read '{ocr_text}' with {confidence}% confidence. "
-                    "Is this likely a valid license plate format? "
-                    "Answer yes/no with brief reasoning."
-                ),
-            }
-        ],
-    )
-    return response.choices[0].message.content or ""
+ALLOWED_ORIGINS = {
+    origin.strip()
+    for origin in os.getenv(
+        "LPRS_AI_ALLOWED_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    ).split(",")
+    if origin.strip()
+}
+MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 
 def process_frame(frame: np.ndarray, camera_id: str = "laptop-browser-1") -> dict:
@@ -153,28 +138,30 @@ def _process_frame(frame: np.ndarray, camera_id: str) -> dict:
 
     ocr_started = time.perf_counter()
     raw_text, confidence = "", 0.0
+    best_crop = crops[0] if crops else vehicle_crop
     for crop in crops:
         max_ocr_variants = 1 if plate_only and plate_bbox is None else None
         candidate_text, candidate_confidence = read_plate(crop, max_variants=max_ocr_variants)
         if candidate_confidence > confidence:
             raw_text, confidence = candidate_text, candidate_confidence
+            best_crop = crop
         if candidate_text and candidate_confidence >= OCR_CONFIDENCE_THRESHOLD and validate_plate(candidate_text)["valid"]:
+            best_crop = crop
             break
     timings["ocr_ms"] = round((time.perf_counter() - ocr_started) * 1000, 1)
+    styling = analyze_plate_styling(best_crop, best.get("class_name", "Vehicle"))
     attempt = OCRAttempt(raw_text=raw_text, plate=raw_text, confidence=confidence)
     if plate_only and not raw_text:
-        return finish({"event": "vehicle_detected", "status": "NO_VEHICLE", "decision": "UNKNOWN", "vehicle_type": "Unknown"})
+        return finish({"event": "vehicle_detected", "status": "NO_VEHICLE", "decision": "UNKNOWN", "vehicle_type": "Unknown", "plate_styling": styling})
     validation = validate_plate(raw_text)
     track_key = f"{camera_id}:{best.get('track_id') if best.get('track_id') is not None else 'untracked'}"
     consensus_started = time.perf_counter()
     summary = _plate_consensus.add(track_key, attempt)
     timings["consensus_ms"] = round((time.perf_counter() - consensus_started) * 1000, 1)
     if summary is None:
-        return finish({"event": "vehicle_detected", "status": "OCR_UNCERTAIN", "decision": "UNKNOWN", "plate": validation["plate"], "raw_ocr": raw_text, "ocr_confidence": confidence, "ocr_consensus": 1, "format_valid": True, "reason": "Waiting for a second consecutive matching frame", "vehicle_type": best["class_name"], "vehicle_bbox": best["bbox"] if vehicles else None, "plate_bbox": plate_bbox_in_frame(plate_bbox), "track_id": best.get("track_id"), "plate_width_pixels": plate_bbox[2] - plate_bbox[0] if plate_bbox else 0})
-    event = build_detection_event(summary, best["class_name"], set(AUTHORIZED_PLATES), OCR_CONFIDENCE_THRESHOLD)
-    if event.get("plate") in UNAUTHORIZED_PLATES:
-        event.update({"status": "UNAUTHORIZED", "decision": "UNAUTHORIZED", "reason": "Plate is explicitly unauthorized"})
-    event.update({"detection_confidence": best["confidence"], "vehicle_bbox": best["bbox"] if vehicles else None, "plate_bbox": plate_bbox_in_frame(plate_bbox), "plate_width_pixels": plate_bbox[2] - plate_bbox[0] if plate_bbox else 0, "track_id": best.get("track_id"), "cameraId": camera_id, "source": "PLATE_ONLY" if plate_only else "REAL", "demoData": False})
+        return finish({"event": "vehicle_detected", "status": "OCR_UNCERTAIN", "decision": "UNKNOWN", "plate": validation["plate"], "raw_ocr": raw_text, "ocr_confidence": confidence, "ocr_consensus": 1, "format_valid": True, "reason": "Waiting for a second consecutive matching frame", "vehicle_type": best["class_name"], "vehicle_bbox": best["bbox"] if vehicles else None, "plate_bbox": plate_bbox_in_frame(plate_bbox), "track_id": best.get("track_id"), "plate_width_pixels": plate_bbox[2] - plate_bbox[0] if plate_bbox else 0, "plate_styling": styling, "plate_category": styling["category"], "plate_bg_hex": styling["bg_hex"], "plate_text_hex": styling["text_hex"], "plate_layout": styling["layout"]})
+    event = build_detection_event(summary, best["class_name"], None, OCR_CONFIDENCE_THRESHOLD)
+    event.update({"detection_confidence": best["confidence"], "vehicle_bbox": best["bbox"] if vehicles else None, "plate_bbox": plate_bbox_in_frame(plate_bbox), "plate_width_pixels": plate_bbox[2] - plate_bbox[0] if plate_bbox else 0, "track_id": best.get("track_id"), "cameraId": camera_id, "source": "PLATE_ONLY" if plate_only else "REAL", "demoData": False, "plate_styling": styling, "plate_category": styling["category"], "plate_bg_hex": styling["bg_hex"], "plate_text_hex": styling["text_hex"], "plate_layout": styling["layout"]})
     return finish(event)
 
 
@@ -182,7 +169,10 @@ class FrameHandler(BaseHTTPRequestHandler):
     def _json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = self.headers.get("Origin")
+        if origin and origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -192,14 +182,31 @@ class FrameHandler(BaseHTTPRequestHandler):
             pass
 
     def do_OPTIONS(self) -> None:
+        origin = self.headers.get("Origin")
+        if origin and origin not in ALLOWED_ORIGINS:
+            self._json(403, {"error": "Origin is not allowed"})
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
         self.end_headers()
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._json(200, {"status": "ok", "service": "python-ai", "pipeline": "YOLO -> plate detection -> EasyOCR -> validation", "startup_timings": {"ocr_model_load_ms": OCR_STARTUP_MS, "plate_model_load_ms": PLATE_MODEL_LOAD_MS}})
+            model_loaded = _plate_detector.model is not None
+            self._json(200 if model_loaded else 503, {
+                "status": "ok" if model_loaded else "degraded",
+                "service": "python-ai",
+                "plate_detector": "trained_weights_loaded" if model_loaded else "contour_fallback",
+                "pipeline": "YOLO -> plate detection -> EasyOCR -> validation",
+                "startup_timings": {
+                    "ocr_model_load_ms": OCR_STARTUP_MS,
+                    "plate_model_load_ms": PLATE_MODEL_LOAD_MS,
+                },
+            })
             return
         self._json(404, {"error": "Not found"})
 
@@ -207,9 +214,16 @@ class FrameHandler(BaseHTTPRequestHandler):
         if self.path != "/process-frame":
             self._json(404, {"error": "Not found"})
             return
+        origin = self.headers.get("Origin")
+        if origin and origin not in ALLOWED_ORIGINS:
+            self._json(403, {"error": "Origin is not allowed"})
+            return
         request_started = time.perf_counter()
         try:
             length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > MAX_FRAME_BYTES:
+                self._json(413, {"error": "Frame request must be between 1 byte and 8 MiB"})
+                return
             payload = json.loads(self.rfile.read(length))
             decode_started = time.perf_counter()
             image = base64.b64decode(payload["image"])
@@ -267,5 +281,6 @@ class FrameHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(os.getenv("LPRS_AI_PORT", "5001"))
-    print(f"Python AI frame service listening on {port}")
-    ThreadingHTTPServer(("0.0.0.0", port), FrameHandler).serve_forever()
+    host = os.getenv("LPRS_AI_HOST", "127.0.0.1")
+    print(f"Python AI frame service listening on {host}:{port}")
+    ThreadingHTTPServer((host, port), FrameHandler).serve_forever()

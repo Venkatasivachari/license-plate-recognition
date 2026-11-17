@@ -1,12 +1,8 @@
 from ultralytics import YOLO
 import cv2
 from pathlib import Path
+from config import PLATE_MODEL_PATH
 
-
-MODEL_PATH = (
-    "runs/detect/runs/license_plate/"
-    "plate_detector/weights/best.pt"
-)
 
 TEST_IMAGES = Path(
     "data/yolo_dataset/images/test"
@@ -24,7 +20,7 @@ def main():
         exist_ok=True
     )
 
-    model = YOLO(MODEL_PATH)
+    model = YOLO(str(PLATE_MODEL_PATH))
 
     images = list(
         TEST_IMAGES.glob("*.jpg")

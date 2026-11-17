@@ -1,5 +1,7 @@
 # Autonomous Vehicle Analytics and LPRS
 
+> Legacy overview: some architecture and environment examples in this file are historical. Use [`README.md`](README.md) and [`PROJECT_GUIDE.md`](PROJECT_GUIDE.md) for the current Supabase-backed authorization flow and setup.
+
 ## Project Overview
 
 Autonomous Vehicle Analytics is a local-first vehicle security and license plate recognition system for Indian vehicle registrations. LPRS means **License Plate Recognition System**.

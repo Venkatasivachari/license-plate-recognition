@@ -223,7 +223,6 @@ create table if not exists public.password_reset_requests (
   customer_id uuid not null references auth.users(id) on delete cascade,
   plate_number text not null,
   owner_name text not null,
-  new_password text,
   status text not null default 'PENDING' check (status in ('PENDING', 'APPROVED', 'REJECTED')),
   resolved_by uuid references auth.users(id) on delete set null,
   resolved_at timestamptz,
@@ -331,11 +330,7 @@ language plpgsql
 security definer
 set search_path = public
 as $$
-declare
-  requested_role text;
 begin
-  requested_role := coalesce(new.raw_user_meta_data->>'role', 'CUSTOMER');
-
   insert into public.profiles (
     id,
     role,
@@ -350,7 +345,7 @@ begin
   )
   values (
     new.id,
-    case when requested_role in ('ADMIN', 'CUSTOMER') then requested_role else 'CUSTOMER' end,
+    'CUSTOMER',
     new.raw_user_meta_data->>'customer_id',
     coalesce(new.raw_user_meta_data->>'full_name', new.raw_user_meta_data->>'display_name', split_part(new.email, '@', 1)),
     new.email,
@@ -449,7 +444,6 @@ drop policy if exists "admins manage sites" on public.sites;
 drop policy if exists "authenticated users read sites" on public.sites;
 drop policy if exists "admins manage profiles" on public.profiles;
 drop policy if exists "users read own profile" on public.profiles;
-drop policy if exists "users update own profile" on public.profiles;
 drop policy if exists "admins manage vehicles" on public.vehicles;
 drop policy if exists "customers read own vehicles" on public.vehicles;
 drop policy if exists "admins manage drivers" on public.drivers;
@@ -457,7 +451,6 @@ drop policy if exists "customers read own drivers" on public.drivers;
 drop policy if exists "customers insert own drivers" on public.drivers;
 drop policy if exists "admins manage permissions" on public.permissions;
 drop policy if exists "customers read own permissions" on public.permissions;
-drop policy if exists "customers insert own permissions" on public.permissions;
 drop policy if exists "admins manage invitations" on public.invitations;
 drop policy if exists "customers read own invitations" on public.invitations;
 drop policy if exists "customers create own invitations" on public.invitations;
@@ -487,7 +480,6 @@ create policy "authenticated users read sites" on public.sites for select using 
 
 create policy "admins manage profiles" on public.profiles for all using (public.is_admin()) with check (public.is_admin());
 create policy "users read own profile" on public.profiles for select using (id = auth.uid());
-create policy "users update own profile" on public.profiles for update using (id = auth.uid()) with check (id = auth.uid());
 
 create policy "admins manage vehicles" on public.vehicles for all using (public.is_admin()) with check (public.is_admin());
 create policy "customers read own vehicles" on public.vehicles for select using (customer_id = auth.uid());
@@ -499,14 +491,6 @@ create policy "customers insert own drivers" on public.drivers for insert with c
 create policy "admins manage permissions" on public.permissions for all using (public.is_admin()) with check (public.is_admin());
 create policy "customers read own permissions" on public.permissions for select using (
   exists (
-    select 1 from public.vehicles v
-    where v.id = permissions.vehicle_id
-      and v.customer_id = auth.uid()
-  )
-);
-create policy "customers insert own permissions" on public.permissions for insert with check (
-  created_by = auth.uid()
-  and exists (
     select 1 from public.vehicles v
     where v.id = permissions.vehicle_id
       and v.customer_id = auth.uid()

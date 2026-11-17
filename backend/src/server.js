@@ -5,22 +5,49 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
+import { prepareAccessEvent } from "./accessEvent.js";
+import { getOcrQualityDecision } from "./ocrQualityGate.js";
 import { addEvent, dashboardStats, recentEvents } from "./store.js";
 import { createAuthClient, supabase, supabaseConfigured } from "./supabase.js";
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
-const server = app.listen(port, () => console.log(`Vehicle security API listening on ${port}`));
 const sockets = new Set();
 const websocketServer = new WebSocketServer({ noServer: true });
-app.use(cors());
+const DEMO_MODE = process.env.DEMO_MODE === "true";
+const allowedOrigins = (process.env.CORS_ORIGINS || (process.env.NODE_ENV === "production" ? "" : "http://localhost:5173,http://127.0.0.1:5173"))
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error("Origin is not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PATCH", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  maxAge: 600,
+}));
+app.use((_request, response, next) => {
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("X-Frame-Options", "DENY");
+  response.setHeader("Referrer-Policy", "no-referrer");
+  response.setHeader("Permissions-Policy", "camera=(self), microphone=(), geolocation=()");
+  next();
+});
 app.use(express.json({ limit: "2mb" }));
 
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN || "";
+if (supabaseConfigured && !SERVICE_TOKEN && !DEMO_MODE) {
+  throw new Error("SERVICE_TOKEN is required when Supabase is configured.");
+}
+const server = app.listen(port, () => console.log(`Vehicle security API listening on ${port}`));
 const AI_HEALTH_URL = process.env.LPRS_AI_URL || "http://localhost:5001";
 const EVIDENCE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../output/evidence");
 const EVENT_DEDUPLICATION_WINDOW_MS = Number(process.env.EVENT_DEDUPLICATION_WINDOW_MS || 30000);
 const recentEventKeys = new Map();
+const authRateLimits = new Map();
+let rateLimitRequests = 0;
 
 const normalizePlate = (value) => String(value || "").replace(/[^A-Z0-9]/gi, "").toUpperCase();
 const isAdmin = (request) => { const role = request.client?.role; return role === "ADMIN" || role === "SERVICE"; };
@@ -33,14 +60,68 @@ const toAuthEmail = (username) => {
 const broadcast = (message) => { const encoded = JSON.stringify(message); for (const socket of sockets) if (socket.readyState === 1) socket.send(encoded); };
 const fail = (response, status, error) => response.status(status).json({ error: String(error) });
 
+function rateLimit({ name, windowMs, max, message }) {
+  return (request, response, next) => {
+    const now = Date.now();
+    const key = `${name}:${request.ip || request.socket.remoteAddress || "unknown"}`;
+    let bucket = authRateLimits.get(key);
+    if (!bucket || now >= bucket.resetAt) {
+      bucket = { count: 0, resetAt: now + windowMs };
+      authRateLimits.set(key, bucket);
+    }
+    bucket.count += 1;
+    rateLimitRequests += 1;
+    if (rateLimitRequests % 256 === 0 || authRateLimits.size > 10000) {
+      for (const [address, entry] of authRateLimits) {
+        if (now >= entry.resetAt) authRateLimits.delete(address);
+      }
+      if (authRateLimits.size > 10000) {
+        const oldestKey = authRateLimits.keys().next().value;
+        if (oldestKey) authRateLimits.delete(oldestKey);
+      }
+    }
+    response.setHeader("RateLimit-Limit", String(max));
+    response.setHeader("RateLimit-Remaining", String(Math.max(0, max - bucket.count)));
+    response.setHeader("RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
+    if (bucket.count > max) {
+      response.setHeader("Retry-After", String(Math.ceil((bucket.resetAt - now) / 1000)));
+      return fail(response, 429, message);
+    }
+    next();
+  };
+}
+
+const loginRateLimit = rateLimit({
+  name: "login",
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: "Too many sign-in attempts. Try again later.",
+});
+const passwordResetRateLimit = rateLimit({
+  name: "password-reset",
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: "Too many password-reset requests. Try again later.",
+});
+const accessEventRateLimit = rateLimit({
+  name: "hardware-access-event",
+  windowMs: 60 * 1000,
+  max: 120,
+  message: "Too many hardware access events. Try again shortly.",
+});
+
 async function getDatabaseHealth() {
   if (!supabaseConfigured) return { status: "IN_MEMORY", connected: false };
   try {
     const { error } = await supabase.from("vehicles").select("id", { head: true }).limit(1);
-    if (error) return { status: "ERROR", connected: false, error: error.message };
+    if (error) {
+      console.error("Database health check failed:", error.message);
+      return { status: "ERROR", connected: false };
+    }
     return { status: "CONNECTED", connected: true };
   } catch (error) {
-    return { status: "ERROR", connected: false, error: error.message };
+    console.error("Database health check failed:", error.message);
+    return { status: "ERROR", connected: false };
   }
 }
 
@@ -110,7 +191,10 @@ async function loadProfile(userId) {
 }
 
 async function authenticate(request, response, next) {
-  if (!supabaseConfigured) return next();
+  if (!supabaseConfigured) {
+    if (DEMO_MODE) return next();
+    return fail(response, 503, "Database authentication is unavailable");
+  }
   const header = request.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
   if (!token) return fail(response, 401, "Authentication required. Send Authorization: Bearer <token>");
@@ -148,14 +232,10 @@ async function evaluateAccess(plateNumber, at = new Date(), ocrContext = {}) {
   const plate = normalizePlate(plateNumber);
   const timestamp = new Date(at).toISOString();
 
-  // OCR quality gates first: never classify OCR failure as unauthorized
+  // Never look up or authorize a plate when OCR marks its result uncertain.
   const statusHint = ocrContext.status || ocrContext.state;
-  if (["OCR_FAILED"].includes(statusHint) && !plate) {
-    return { vehicle: null, invitation: null, permission: null, status: "OCR_FAILED", decision: "UNKNOWN", reason: "OCR returned no readable plate" };
-  }
-  if (["OCR_UNCERTAIN", "INVALID_PLATE"].includes(statusHint) && !plate) {
-    return { vehicle: null, invitation: null, permission: null, status: statusHint, decision: "UNKNOWN", reason: "OCR confidence below threshold; continue reading frames" };
-  }
+  const qualityDecision = getOcrQualityDecision(plate, statusHint);
+  if (qualityDecision) return qualityDecision;
   if (!plate) {
     return { vehicle: null, invitation: null, permission: null, status: "OCR_FAILED", decision: "UNKNOWN", reason: "No plate supplied" };
   }
@@ -173,7 +253,8 @@ async function evaluateAccess(plateNumber, at = new Date(), ocrContext = {}) {
 
   // 1) Registered vehicle with an ACTIVE permission inside its time window
   if (vehicle) {
-    const { data: permission, error: permissionError } = await supabase.from("permissions")
+    let permission = null;
+    let { data: permData, error: permissionError } = await supabase.from("permissions")
       .select("*")
       .eq("normalized_plate", plate)
       .in("status", ["ACTIVE", "PERMANENT"])
@@ -182,7 +263,20 @@ async function evaluateAccess(plateNumber, at = new Date(), ocrContext = {}) {
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle();
+
+    if (permissionError && String(permissionError.message).includes("valid_from")) {
+      const fallbackQuery = await supabase.from("permissions")
+        .select("*")
+        .eq("normalized_plate", plate)
+        .in("status", ["ACTIVE", "PERMANENT"])
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      permData = fallbackQuery.data || null;
+      permissionError = null;
+    }
     if (permissionError) throw permissionError;
+    permission = permData;
 
     const permissionValid = permission && (!permission.valid_from || timestamp >= permission.valid_from) && (!permission.valid_until || timestamp <= permission.valid_until);
     if (permissionValid && permission.status === "BLOCKED") {
@@ -360,16 +454,142 @@ async function persistEvent(payload) {
 // ============================================================
 // ROUTES: Health
 // ============================================================
-app.get("/", (_request, response) => response.json({
-  service: "vehicle-security-backend",
-  message: "Backend API is running. Use the health endpoint to inspect database and AI connectivity.",
-  health: "/health",
-  status: "/api/system/status",
-}));
+app.get("/", (request, response) => {
+  if (request.accepts("html")) {
+    return response.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NexPlate LPRS — System Active</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      background: radial-gradient(circle at top right, #111a2e 0%, #080c14 100%);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #f8fafc;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      background: rgba(17, 24, 39, 0.85);
+      border: 1px solid rgba(56, 189, 248, 0.25);
+      backdrop-filter: blur(16px);
+      border-radius: 16px;
+      padding: 40px;
+      max-width: 520px;
+      width: 90%;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6), 0 0 40px rgba(56, 189, 248, 0.1);
+      text-align: center;
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      padding: 6px 14px;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-bottom: 20px;
+    }
+    h1 {
+      margin: 0 0 10px 0;
+      font-size: 1.75rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #ffffff 0%, #94a3b8 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    p {
+      color: #94a3b8;
+      font-size: 0.95rem;
+      line-height: 1.5;
+      margin-bottom: 28px;
+    }
+    .launch-btn {
+      display: block;
+      background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+      color: #ffffff;
+      text-decoration: none;
+      padding: 14px 28px;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 1.05rem;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 15px rgba(2, 132, 199, 0.4);
+    }
+    .launch-btn:hover {
+      background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(2, 132, 199, 0.6);
+    }
+    .services {
+      margin-top: 30px;
+      padding-top: 20px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 10px;
+      font-size: 0.8rem;
+    }
+    .service-pill {
+      background: rgba(255, 255, 255, 0.04);
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .service-pill strong {
+      display: block;
+      color: #38bdf8;
+      margin-bottom: 2px;
+    }
+  </style>
+  <script>
+    setTimeout(() => {
+      window.location.href = "http://localhost:5173";
+    }, 1500);
+  </script>
+</head>
+<body>
+  <div class="card">
+    <div class="badge">● All Systems Operational</div>
+    <h1>NexPlate Command Console</h1>
+    <p>You have accessed the Node.js API Gateway (Port 4000). Redirecting to the interactive React Dashboard...</p>
+    <a href="http://localhost:5173" class="launch-btn">Open Web Dashboard (Port 5173) &rarr;</a>
+    <div class="services">
+      <div class="service-pill">
+        <strong>Vite UI</strong>
+        Port 5173
+      </div>
+      <div class="service-pill">
+        <strong>Express API</strong>
+        Port 4000
+      </div>
+      <div class="service-pill">
+        <strong>Python AI</strong>
+        Port 5001
+      </div>
+    </div>
+  </div>
+</body>
+</html>`);
+  }
+  response.json({
+    service: "vehicle-security-backend",
+    message: "Backend API is running. Use the health endpoint to inspect database and AI connectivity.",
+    frontend: "http://localhost:5173",
+    health: "/health",
+    status: "/api/system/status",
+  });
+});
 
 app.get("/health", async (_request, response) => {
   const [database, ai] = await Promise.all([getDatabaseHealth(), getAiHealth()]);
-  const status = database.status === "ERROR" ? "degraded" : "ok";
+  const status = database.connected ? "ok" : "degraded";
   response.status(status === "ok" ? 200 : 503).json({ status, service: "backend", database, ai });
 });
 
@@ -381,7 +601,7 @@ app.get("/api/system/status", async (_request, response) => {
 // ============================================================
 // ROUTES: Auth
 // ============================================================
-app.post("/api/auth/login", async (request, response) => {
+app.post("/api/auth/login", loginRateLimit, async (request, response) => {
   if (!supabaseConfigured) return fail(response, 503, "Supabase is not configured on this backend");
   const { username, password, role: requestedRole } = request.body || {};
   if (!username || !password) return fail(response, 400, "username and password are required");
@@ -422,7 +642,7 @@ app.post("/api/auth/login", async (request, response) => {
     }
 
     const profile = await loadProfile(authResult.user.id);
-    const role = profile?.role || authResult.user.user_metadata?.role || "CUSTOMER";
+    const role = profile?.role || "CUSTOMER";
     if (requestedRole && role !== requestedRole) return fail(response, 403, "Account does not match the selected role");
     response.json({
       access_token: authResult.session.access_token,
@@ -443,7 +663,7 @@ app.post("/api/auth/login", async (request, response) => {
   }
 });
 
-app.post("/api/auth/admin-password-reset", async (request, response) => {
+app.post("/api/auth/admin-password-reset", passwordResetRateLimit, async (request, response) => {
   const { adminId, displayName } = request.body || {};
   if (!adminId || !displayName) return fail(response, 400, "Admin ID/email and registered name are required");
   if (!supabaseConfigured) return fail(response, 503, "Supabase is not configured on this backend");
@@ -494,11 +714,36 @@ app.use("/api", (request, response, next) => { if (request.path.startsWith("/aut
 // ============================================================
 // ROUTES: Evidence
 // ============================================================
-app.get("/api/evidence/:name", (request, response) => {
+app.get("/api/evidence/:name", async (request, response) => {
   const name = path.basename(request.params.name);
   const filePath = path.join(EVIDENCE_DIR, name);
-  if (!fs.existsSync(filePath)) return fail(response, 404, "Evidence frame not found");
-  response.sendFile(filePath);
+  try {
+    if (!isAdmin(request)) {
+      if (!supabaseConfigured) return fail(response, 503, "Database is unavailable");
+      const ownedIds = await ownedVehicleIds(request);
+      if (!ownedIds.length) return fail(response, 404, "Evidence frame not found");
+      const { data: detections, error: detectionError } = await supabase
+        .from("detections")
+        .select("id")
+        .in("vehicle_id", ownedIds);
+      if (detectionError) throw detectionError;
+      const detectionIds = (detections || []).map((detection) => detection.id);
+      if (!detectionIds.length) return fail(response, 404, "Evidence frame not found");
+      const { data: evidence, error: evidenceError } = await supabase
+        .from("evidence")
+        .select("file_path")
+        .in("detection_id", detectionIds)
+        .limit(1000);
+      if (evidenceError) throw evidenceError;
+      if (!(evidence || []).some((item) => path.basename(item.file_path) === name)) {
+        return fail(response, 404, "Evidence frame not found");
+      }
+    }
+    if (!fs.existsSync(filePath)) return fail(response, 404, "Evidence frame not found");
+    response.sendFile(filePath);
+  } catch (error) {
+    fail(response, 503, error.message);
+  }
 });
 
 app.get("/api/evidence", async (request, response) => {
@@ -506,6 +751,18 @@ app.get("/api/evidence", async (request, response) => {
     if (!supabaseConfigured) return response.json([]);
     const { detection_id } = request.query;
     let builder = supabase.from("evidence").select("*").order("created_at", { ascending: false }).limit(500);
+    if (!isAdmin(request)) {
+      const ownedIds = await ownedVehicleIds(request);
+      if (!ownedIds.length) return response.json([]);
+      const { data: detections, error: detectionError } = await supabase
+        .from("detections")
+        .select("id")
+        .in("vehicle_id", ownedIds);
+      if (detectionError) throw detectionError;
+      const detectionIds = (detections || []).map((detection) => detection.id);
+      if (!detectionIds.length) return response.json([]);
+      builder = builder.in("detection_id", detectionIds);
+    }
     if (detection_id) builder = builder.eq("detection_id", detection_id);
     const { data, error } = await builder;
     if (error) throw error;
@@ -515,7 +772,7 @@ app.get("/api/evidence", async (request, response) => {
   }
 });
 
-app.post("/api/evidence", async (request, response) => {
+app.post("/api/evidence", requireRole("ADMIN"), async (request, response) => {
   const { detection_id, file_path, file_url, file_size, mime_type, metadata } = request.body || {};
   if (!detection_id || !file_path) return fail(response, 400, "detection_id and file_path are required");
   try {
@@ -883,13 +1140,13 @@ app.post("/api/permissions", requireRole("ADMIN"), async (request, response) => 
   if (!plate) return fail(response, 400, "A plate number is required");
   if (body.validFrom && body.validUntil && new Date(body.validUntil) <= new Date(body.validFrom)) return fail(response, 400, "valid_until must be after valid_from");
   try {
-    const { data, error } = await supabase.from("permissions").insert({
+    let insertPayload = {
       plate_number: plate,
       normalized_plate: plate,
       vehicle_id: body.vehicle_id || body.vehicleId || null,
       person: body.person || null,
       purpose: body.purpose || "Visitor",
-      valid_date: body.validDate || body.valid_date || null,
+      valid_date: body.validDate || body.valid_date || (body.validFrom ? String(body.validFrom).slice(0, 10) : null),
       valid_from: body.validFrom || body.valid_from || null,
       valid_until: body.validUntil || body.valid_until || null,
       allowed_entry_from: body.allowedEntryFrom || body.allowed_entry_from || null,
@@ -897,10 +1154,25 @@ app.post("/api/permissions", requireRole("ADMIN"), async (request, response) => 
       reason: body.reason || null,
       status: body.status || "ACTIVE",
       created_by: request.client?.id === "service" ? null : request.client?.id || null,
-    }).select().single();
+    };
+    let { data, error } = await supabase.from("permissions").insert(insertPayload).select().single();
+    if (error && String(error.message).includes("valid_from")) {
+      const basePayload = {
+        plate_number: plate,
+        normalized_plate: plate,
+        person: body.person || null,
+        purpose: body.purpose || "Visitor",
+        valid_date: body.validDate || body.valid_date || (body.validFrom ? String(body.validFrom).slice(0, 10) : null),
+        status: body.status || "ACTIVE",
+        created_by: request.client?.id === "service" ? null : request.client?.id || null,
+      };
+      const retry = await supabase.from("permissions").insert(basePayload).select().single();
+      data = retry.data;
+      error = retry.error;
+    }
     if (error) throw error;
     await writeAudit("PERMISSION_CREATED", "permission", data.id, request, { plateNumber: plate });
-    response.status(201).json({ ...data, plateNumber: data.plate_number, validDate: data.valid_date, validFrom: data.valid_from, validUntil: data.valid_until });
+    response.status(201).json({ ...data, plateNumber: data.plate_number, validDate: data.valid_date, validFrom: data.valid_from || null, validUntil: data.valid_until || null });
   } catch (error) {
     if (/PGRST205|Could not find the table/.test(String(error.message))) return response.status(503).json({ error: "permissions table is not migrated. Run supabase/schema.sql in the Supabase SQL Editor to enable permission sync." });
     fail(response, 503, error.message);
@@ -960,6 +1232,34 @@ app.post("/api/events", requireRole("ADMIN"), async (request, response) => {
   }
 });
 
+app.post("/api/access/events", requireRole("SERVICE"), accessEventRateLimit, async (request, response) => {
+  if (!supabaseConfigured) return fail(response, 503, "Database access decisions are unavailable");
+
+  let payload;
+  try {
+    payload = prepareAccessEvent(request.body, {
+      minimumConfidence: Number(process.env.LPRS_OCR_CONFIDENCE || 0.3),
+      minimumConsensus: Math.max(1, Number(process.env.LPRS_OCR_CONSENSUS_FRAMES || 2)),
+    });
+  } catch (error) {
+    return fail(response, 400, error.message);
+  }
+
+  try {
+    const event = await persistEvent(payload);
+    rememberEvent(payload);
+    broadcast({ type: "vehicle_detected", data: event });
+    await writeAudit("DETECTION_RECORDED", "detection", event.id, request, {
+      plateNumber: event.plateNumber,
+      cameraId: event.cameraId || payload.cameraId,
+      status: event.status,
+    });
+    response.status(201).json(event);
+  } catch (error) {
+    fail(response, 503, error.message);
+  }
+});
+
 // ============================================================
 // ROUTES: Visits
 // ============================================================
@@ -988,18 +1288,36 @@ app.get("/api/visits", async (request, response) => {
 // ============================================================
 // ROUTES: Alerts
 // ============================================================
+async function getCustomerAlertFilters(client) {
+  const { data: ownVehicles, error: vehicleError } = await supabase
+    .from("vehicles")
+    .select("id")
+    .eq("customer_id", client.id);
+  if (vehicleError) throw vehicleError;
+
+  const vehicleIds = (ownVehicles || []).map((vehicle) => vehicle.id);
+  let detectionIds = [];
+  if (vehicleIds.length) {
+    const { data: ownDetections, error: detectionError } = await supabase
+      .from("detections")
+      .select("id")
+      .in("vehicle_id", vehicleIds);
+    if (detectionError) throw detectionError;
+    detectionIds = (ownDetections || []).map((detection) => detection.id);
+  }
+
+  const filters = [];
+  if (detectionIds.length) filters.push(`detection_id.in.(${detectionIds.join(",")})`);
+  if (client.profile?.plate_number) filters.push(`plate_number.eq.${client.profile.plate_number}`);
+  return filters;
+}
+
 app.get("/api/alerts", async (request, response) => {
   try {
     if (!supabaseConfigured) return response.json([]);
     let builder = supabase.from("alerts").select("*").order("created_at", { ascending: false }).limit(1000);
     if (!isAdmin(request)) {
-      const { data: ownVehicles } = await supabase.from("vehicles").select("id").eq("customer_id", request.client.id);
-      const ids = ownVehicles?.map((vehicle) => vehicle.id) || [];
-      const { data: ownDetections } = ids.length ? await supabase.from("detections").select("id").in("vehicle_id", ids) : { data: [] };
-      const detIds = ownDetections?.map((detection) => detection.id) || [];
-      const filters = [];
-      if (detIds.length) filters.push(`detection_id.in.(${detIds.join(",")})`);
-      if (request.client.profile?.plate_number) filters.push(`plate_number.eq.${request.client.profile.plate_number}`);
+      const filters = await getCustomerAlertFilters(request.client);
       if (!filters.length) return response.json([]);
       builder = builder.or(filters.join(","));
     }
@@ -1014,9 +1332,18 @@ app.get("/api/alerts", async (request, response) => {
 app.post("/api/alerts/:id/read", async (request, response) => {
   try {
     if (!supabaseConfigured) return response.json({ ok: true });
-    let builder = supabase.from("alerts").update({ is_read: true, acknowledged_by: request.client?.id === "service" ? null : request.client?.id || null, acknowledged_at: new Date().toISOString() }).eq("id", request.params.id).select().single();
-    if (!isAdmin(request)) builder = builder.eq("plate_number", request.client.profile?.plate_number || "__none__");
-    const { data, error } = await builder;
+    let builder = supabase.from("alerts").update({
+      is_read: true,
+      acknowledged_by: request.client?.id === "service" ? null : request.client?.id || null,
+      acknowledged_at: new Date().toISOString(),
+    }).eq("id", request.params.id);
+    if (!isAdmin(request)) {
+      const filters = await getCustomerAlertFilters(request.client);
+      if (!filters.length) return response.status(404).json({ error: "Alert not found" });
+      builder = builder.or(filters.join(","));
+    }
+    const { data, error } = await builder.select().single();
+    if (error?.code === "PGRST116") return response.status(404).json({ error: "Alert not found" });
     if (error) throw error;
     await writeAudit("ALERT_ACKNOWLEDGED", "alert", data.id, request, { plateNumber: data.plate_number, type: data.type });
     response.json(data);
@@ -1046,7 +1373,7 @@ app.get("/api/analytics/dashboard", requireRole("ADMIN"), async (_request, respo
 // ============================================================
 // ROUTES: Password Reset
 // ============================================================
-app.post("/api/password-reset/request", async (request, response) => {
+app.post("/api/password-reset/request", passwordResetRateLimit, async (request, response) => {
   const { plateNumber, ownerName } = request.body || {};
   const plate = normalizePlate(plateNumber);
   if (!plate || !ownerName) return fail(response, 400, "Vehicle number and owner name are required");
@@ -1054,12 +1381,21 @@ app.post("/api/password-reset/request", async (request, response) => {
     if (!supabaseConfigured) return fail(response, 503, "Supabase is not configured");
     const { data: vehicle, error } = await supabase.from("vehicles").select("*").eq("normalized_plate", plate).maybeSingle();
     if (error) throw error;
-    if (!vehicle?.customer_id) return fail(response, 404, "No linked customer account found for this vehicle");
-    if (String(vehicle.owner_name || "").trim().toLowerCase() !== String(ownerName).trim().toLowerCase()) return fail(response, 400, "Owner name does not match the registered vehicle");
+    const matchesOwner = vehicle?.customer_id
+      && String(vehicle.owner_name || "").trim().toLowerCase() === String(ownerName).trim().toLowerCase();
+    if (!matchesOwner) {
+      return response.status(202).json({
+        status: "REQUESTED",
+        message: "If the supplied details match a registered account, the request will be reviewed.",
+      });
+    }
     const { data, error: insertError } = await supabase.from("password_reset_requests").insert({ customer_id: vehicle.customer_id, plate_number: plate, owner_name: ownerName, status: "PENDING" }).select().single();
     if (insertError) throw insertError;
     await writeAudit("PASSWORD_RESET_REQUESTED", "password_reset_request", data.id, request, { plateNumber: plate });
-    response.status(201).json(data);
+    response.status(202).json({
+      status: "REQUESTED",
+      message: "If the supplied details match a registered account, the request will be reviewed.",
+    });
   } catch (error) {
     fail(response, 503, error.message);
   }
@@ -1068,7 +1404,11 @@ app.post("/api/password-reset/request", async (request, response) => {
 app.get("/api/password-reset/requests", (request, response, next) => (supabaseConfigured ? requireRole("ADMIN")(request, response, next) : next()), async (request, response) => {
   try {
     if (!supabaseConfigured) return response.json([]);
-    const { data, error } = await supabase.from("password_reset_requests").select("*").order("created_at", { ascending: false }).limit(200);
+    const { data, error } = await supabase
+      .from("password_reset_requests")
+      .select("id,customer_id,plate_number,owner_name,status,resolved_by,resolved_at,created_at")
+      .order("created_at", { ascending: false })
+      .limit(200);
     if (error) throw error;
     response.json(data);
   } catch (error) {
@@ -1171,7 +1511,11 @@ app.patch("/api/complaints/:id", (request, response, next) => (supabaseConfigure
 // ============================================================
 // ERROR HANDLER
 // ============================================================
-app.use((error, _request, response, _next) => fail(response, 500, error.message));
+app.use((error, _request, response, _next) => {
+  if (error.message === "Origin is not allowed by CORS") return fail(response, 403, error.message);
+  if (error.type === "entity.parse.failed") return fail(response, 400, "Invalid JSON request body");
+  return fail(response, 500, "Internal server error");
+});
 
 // ============================================================
 // VISIT AUTO-CLOSE (inactive sessions)

@@ -6,5 +6,4 @@ numpy
 pandas
 Pillow
 pyserial
-openai
 python-dotenv

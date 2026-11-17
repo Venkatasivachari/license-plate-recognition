@@ -8,16 +8,13 @@ from collections import Counter
 
 from ocr import read_plate
 from plate_validator import validate_plate
+from backend_access import BackendAccessError, evaluate_plate_access
+from config import PLATE_MODEL_PATH
 
 
 # ============================================================
 # SETTINGS
 # ============================================================
-
-MODEL_PATH = (
-    "runs/detect/runs/license_plate/"
-    "plate_detector/weights/best.pt"
-)
 
 ARDUINO_PORT = "COM6"
 
@@ -29,23 +26,6 @@ CAMERA_INDEX = 0
 # ============================================================
 # AUTHORIZED VEHICLES
 # ============================================================
-
-AUTHORIZED_PLATES = {
-
-    "AP12JA1234",
-
-    "AP27AB1234",
-
-    "AP16CD5678",
-
-    "AP09EF2468",
-
-    "AP39GH1357",
-
-    "AP40RS1357",
-
-}
-
 
 # ============================================================
 # OCR SETTINGS
@@ -316,9 +296,7 @@ def main():
         "Loading YOLO model..."
     )
 
-    model = YOLO(
-        MODEL_PATH
-    )
+    model = YOLO(str(PLATE_MODEL_PATH))
 
     print(
         "YOLO model loaded."
@@ -826,11 +804,26 @@ def main():
 
                         else:
 
-                            if (
-                                best_plate
-                                in AUTHORIZED_PLATES
-                            ):
+                            access_reason = "Backend decision unavailable"
+                            try:
+                                access_result = evaluate_plate_access(
+                                    best_plate,
+                                    confidence,
+                                    consensus,
+                                    f"live-camera-{CAMERA_INDEX}",
+                                )
+                                access_decision = access_result["decision"]
+                                access_reason = (
+                                    access_result.get("decisionReason")
+                                    or access_result.get("reason")
+                                    or access_reason
+                                )
+                            except (BackendAccessError, ValueError) as error:
+                                access_decision = "UNKNOWN"
+                                access_reason = str(error)
+                                print(f"BACKEND ACCESS LOOKUP FAILED: {error}")
 
+                            if access_decision == "AUTHORIZED":
                                 current_status = (
                                     "AUTHORIZED"
                                 )
@@ -891,7 +884,7 @@ def main():
                                         pass
 
 
-                            else:
+                            elif access_decision == "UNAUTHORIZED":
 
                                 current_status = (
                                     "UNAUTHORIZED"
@@ -958,6 +951,16 @@ def main():
 
                                         pass
 
+                            else:
+
+                                current_status = "UNKNOWN"
+                                print("ACCESS DECISION : UNKNOWN")
+                                print(access_reason)
+                                if arduino:
+                                    try:
+                                        arduino.write(b"0")
+                                    except serial.SerialException as error:
+                                        print(f"BUZZER RESET FAILED: {error}")
 
                     # --------------------------------------------
                     # Lock vehicle session

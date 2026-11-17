@@ -6,9 +6,8 @@ from pathlib import Path
 from ocr import read_plate
 
 from plate_validator import validate_plate
+from config import PLATE_MODEL_PATH
 
-
-MODEL_PATH = "runs/detect/runs/license_plate/plate_detector/weights/best.pt"
 
 TEST_IMAGES = Path("data/yolo_dataset/images/test")
 
@@ -19,7 +18,7 @@ def main():
 
     print("Loading YOLO model...")
 
-    model = YOLO(MODEL_PATH)
+    model = YOLO(str(PLATE_MODEL_PATH))
 
     print("YOLO model loaded.")
 

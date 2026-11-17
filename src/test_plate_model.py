@@ -1,9 +1,8 @@
 from ultralytics import YOLO
 from pathlib import Path
+from config import PLATE_MODEL_PATH
 
 
-# MODEL_PATH = "runs/license_plate/plate_detector/weights/best.pt"
-MODEL_PATH = "runs/detect/runs/license_plate/plate_detector/weights/best.pt"
 TEST_IMAGES = "data/yolo_dataset/images/test"
 
 OUTPUT_DIR = "output/plate_test"
@@ -13,7 +12,7 @@ def main():
 
     print("Loading trained model...")
 
-    model = YOLO(MODEL_PATH)
+    model = YOLO(str(PLATE_MODEL_PATH))
 
     print("Model loaded successfully!")
 

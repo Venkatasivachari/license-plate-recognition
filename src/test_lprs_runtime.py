@@ -67,6 +67,18 @@ class LPRSRuntimeTests(unittest.TestCase):
         self.assertEqual(event["decision"], "UNKNOWN")
         self.assertFalse(event["format_valid"])
 
+    def test_live_detection_defers_access_authorization_to_backend(self):
+        event = build_detection_event(
+            summarize_ocr([OCRAttempt("AP12JA1234", "AP12JA1234", 0.91)]),
+            "car",
+            None,
+            0.30,
+        )
+
+        self.assertEqual(event["status"], "RECOGNIZED")
+        self.assertEqual(event["decision"], "UNKNOWN")
+        self.assertIn("backend lookup", event["reason"])
+
     def test_plate_consensus_requires_repeated_valid_reads(self):
         consensus = PlateConsensus(minimum_votes=2, window_seconds=30)
         attempt = OCRAttempt("AP12JA1234", "AP12JA1234", 0.82)

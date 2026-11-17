@@ -1,17 +1,52 @@
-import { jsPDF } from "jspdf";
-import autoTable from "jspdf-autotable";
 import { Activity, BarChart3, Bike, Car, CarFront, CheckCircle2, ChevronDown, CircleAlert, ClipboardList, Download, Eye, EyeOff, FileBarChart, Gauge, KeyRound, List, LockKeyhole, MessageSquareWarning, Plus, Search, Settings, ShieldCheck, ShieldX, Ticket, Truck, UserPlus, Video, VideoOff, X, XCircle } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { useEffect, useRef, useState } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { createRoot } from "react-dom/client";
-import * as XLSX from "xlsx-js-style";
+import { createPortal } from "react-dom";
 import { CyberBackground } from "./CyberBackground";
-import { apiLogin, apiLogout, blockVehicle, clearDemoData, createComplaint, createInvitation, createPermission, createVehicle, evaluateAccessSync, fetchCollectionFromAPI, generateCustomerCode, getAccessToken, getAccountVehicles, getCollection, getComplaints, getPasswordResetRequests, getPlateContextAPI, getSettings, getVehicleDetections, getVehicleStats, getVehicles, getVehiclesSync, isIndianPlateFormat, markAlertRead, normalizePlate, requestPasswordReset, resetAdminPassword, resolvePasswordReset, saveSetting, searchVehiclesSync, seedDemoData, syncBackendData, updateComplaintStatus } from "./services/localStorageService";
+import { apiLogin, apiLogout, blockVehicle, clearDemoData, createComplaint, createInvitation, createPermission, createVehicle, evaluateAccessSync, fetchCollectionFromAPI, fetchCustomerPortalData, generateCustomerCode, getAccessToken, getCollection, getComplaints, getPasswordResetRequests, getPlateContextAPI, getSettings, getVehicleDetections, getVehicles, getVehiclesSync, isIndianPlateFormat, markAlertRead, normalizePlate, requestPasswordReset, resetAdminPassword, resolvePasswordReset, saveSetting, searchVehiclesSync, seedDemoData, syncBackendData, updateComplaintStatus } from "./services/localStorageService";
 import "./styles.css";
 
-const navItems = ["Dashboard", "Live Monitoring", "Vehicles", "Register Vehicle", "Permissions", "Invitations", "Visit History", "Vehicle Verification Center", "Alerts", "Password Requests", "Complaints", "Analytics", "Reports", "Settings"];
-const navIcons = { Dashboard: BarChart3, "Live Monitoring": Video, Vehicles: CarFront, "Register Vehicle": UserPlus, Permissions: ShieldCheck, Invitations: Ticket, "Visit History": ClipboardList, "Vehicle Verification Center": Search, Alerts: CircleAlert, "Password Requests": KeyRound, Complaints: MessageSquareWarning, Analytics: BarChart3, Reports: FileBarChart, Settings };
+const navGroups = [
+  {
+    title: "Live Operations",
+    items: [
+      { id: "Dashboard", label: "Dashboard", icon: BarChart3 },
+      { id: "Live Monitoring", label: "Live Monitoring", icon: Video, badge: "AI" },
+      { id: "Vehicle Verification Center", label: "Verification Center", icon: Search },
+    ],
+  },
+  {
+    title: "Fleet & Access",
+    items: [
+      { id: "Vehicles", label: "Vehicle Registry", icon: CarFront },
+      { id: "Register Vehicle", label: "Register Vehicle", icon: UserPlus },
+      { id: "Permissions", label: "Access Permissions", icon: ShieldCheck },
+      { id: "Invitations", label: "Visitor Passes", icon: Ticket },
+      { id: "Visit History", label: "Visit Logs", icon: ClipboardList },
+    ],
+  },
+  {
+    title: "Security & Intel",
+    items: [
+      { id: "Alerts", label: "Security Alerts", icon: CircleAlert },
+      { id: "Analytics", label: "Analytics & Trends", icon: Gauge },
+      { id: "Reports", label: "Export Reports", icon: FileBarChart },
+    ],
+  },
+  {
+    title: "System & Support",
+    items: [
+      { id: "Complaints", label: "Support & Issues", icon: MessageSquareWarning },
+      { id: "Password Requests", label: "Reset Requests", icon: KeyRound },
+      { id: "Settings", label: "Diagnostics", icon: Settings },
+    ],
+  },
+];
+
+const navItems = navGroups.flatMap((group) => group.items.map((item) => item.id));
+const navIcons = Object.fromEntries(navGroups.flatMap((group) => group.items.map((item) => [item.id, item.icon])));
 const adminNavMap = {
   "/dashboard": "Dashboard",
   "/live-monitoring": "Live Monitoring",
@@ -29,6 +64,19 @@ const adminNavMap = {
   "/settings": "Settings",
 };
 const routeFromPage = Object.fromEntries(Object.entries(adminNavMap).map(([path, label]) => [label, path]));
+const customerRouteMap = {
+  "/customer": "Dashboard",
+  "/customer/dashboard": "Dashboard",
+  "/customer/vehicles": "Vehicles",
+  "/customer/invitations": "Invitations",
+  "/customer/history": "History",
+  "/customer/complaints": "Complaints",
+  "/customer/alerts": "Alerts",
+  "/customer/reports": "Reports",
+  "/customer/settings": "Settings",
+  "/customer/backup": "Backup",
+};
+const customerPathForSection = Object.fromEntries(Object.entries(customerRouteMap).map(([path, section]) => [section, path === "/customer" ? "/customer/dashboard" : path]));
 const aiUrl = import.meta.env.VITE_AI_URL || "http://localhost:5001";
 const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:4000";
 const aiEnabled = import.meta.env.VITE_ENABLE_AI !== "false";
@@ -88,14 +136,56 @@ const normalizeLiveEvent = (event) => {
 const readStoredUser = () => {
   try {
     const raw = localStorage.getItem("nexplate-current-user");
-    return raw ? JSON.parse(raw) : null;
+    if (!raw) return null;
+    const user = JSON.parse(raw);
+    if (user && Object.hasOwn(user, "password")) {
+      delete user.password;
+      localStorage.setItem("nexplate-current-user", JSON.stringify(user));
+    }
+    return user;
   } catch {
     return null;
   }
 };
 
+function useDebouncedValue(value, delay = 200) {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedValue(value), delay);
+    return () => window.clearTimeout(timer);
+  }, [value, delay]);
+  return debouncedValue;
+}
+
 function App() {
   const [currentUser, setCurrentUser] = useState(() => readStoredUser());
+
+  useEffect(() => {
+    const rootElement = document.getElementById("root");
+    if (!rootElement) return undefined;
+    let frame = 0;
+    const addMobileTableLabels = () => {
+      frame = 0;
+      rootElement.querySelectorAll(".table-wrap table").forEach((table) => {
+        const labels = Array.from(table.querySelectorAll("thead th"), (cell) => cell.textContent.trim());
+        table.querySelectorAll("tbody tr").forEach((row) => {
+          Array.from(row.cells).forEach((cell, index) => {
+            if (labels[index]) cell.dataset.label = labels[index];
+          });
+        });
+      });
+    };
+    const scheduleLabels = () => {
+      if (!frame) frame = window.requestAnimationFrame(addMobileTableLabels);
+    };
+    scheduleLabels();
+    const observer = new MutationObserver(scheduleLabels);
+    observer.observe(rootElement, { childList: true, subtree: true });
+    return () => {
+      observer.disconnect();
+      if (frame) window.cancelAnimationFrame(frame);
+    };
+  }, []);
 
   useEffect(() => {
     if (!currentUser) {
@@ -126,11 +216,13 @@ function ProtectedApp({ currentUser, setCurrentUser }) {
     }
     if (currentUser.role === "CUSTOMER") {
       if (location.pathname === "/login" || location.pathname === "/") {
-        navigate("/customer", { replace: true });
+        navigate("/customer/dashboard", { replace: true });
+      } else if (!Object.hasOwn(customerRouteMap, location.pathname)) {
+        navigate("/customer/dashboard", { replace: true });
       }
       return;
     }
-    if (location.pathname === "/login" || location.pathname === "/" || location.pathname === "/customer") {
+    if (location.pathname === "/login" || location.pathname === "/" || location.pathname.startsWith("/customer")) {
       navigate("/dashboard", { replace: true });
       return;
     }
@@ -146,6 +238,7 @@ function ProtectedApp({ currentUser, setCurrentUser }) {
   const [alerts, setAlerts] = useState([]);
   const [cameraOn, setCameraOn] = useState(false);
   const [query, setQuery] = useState("");
+  const debouncedQuery = useDebouncedValue(query);
   const [toast, setToast] = useState("");
   const [selectedPlate, setSelectedPlate] = useState("");
   const [manualLookup, setManualLookup] = useState(false);
@@ -163,7 +256,7 @@ function ProtectedApp({ currentUser, setCurrentUser }) {
   }
 
   if (currentUser.role === "CUSTOMER") {
-    return <CustomerDashboard account={currentUser} onLogout={handleLogout} />;
+    return <CustomerDashboard account={currentUser} onLogout={handleLogout} location={location} navigate={navigate} />;
   }
 
   const refresh = () => {
@@ -225,9 +318,112 @@ function ProtectedApp({ currentUser, setCurrentUser }) {
     setDetections((current) => mergeDetectionRows(current, [finalEvent]));
     Promise.all([fetchCollectionFromAPI("detections"), fetchCollectionFromAPI("visits"), fetchCollectionFromAPI("alerts")]).catch(() => { });
   };
-  const content2 = page === "Dashboard" ? <Dashboard stats={stats} detections={detections} current={currentDetection} visits={allVisits} cameraOn={cameraOn} toggleCamera={toggleCamera} onDetection={handleLiveDetection} openLookup={() => setManualLookup(true)} /> : page === "Live Monitoring" ? <Live current={currentDetection} cameraOn={cameraOn} toggleCamera={toggleCamera} onDetection={handleLiveDetection} openLookup={() => setManualLookup(true)} /> : page === "Vehicles" ? (selectedPlate ? <Profile plate={selectedPlate} vehicles={vehicles} detections={detections} nav={nav} /> : <Vehicles vehicles={query ? searchVehiclesSync(query) : vehicles} query={query} setQuery={setQuery} nav={nav} notify={notify} select={setSelectedPlate} />) : page === "Register Vehicle" ? <Registration nav={nav} notify={notify} vehicles={vehicles} /> : page === "Vehicle Verification Center" ? <Validator vehicles={vehicles} nav={nav} /> : page === "Reports" ? <Reports vehicles={vehicles} visits={allVisits} detections={detections} /> : page === "Analytics" ? <Analytics vehicles={vehicles} visits={allVisits} detections={detections} /> : page === "Settings" ? <Diagnostics cameraOn={cameraOn} toggleCamera={toggleCamera} aiOnline={aiOnline} /> : page === "Permissions" ? <AccessManager title="Permissions" collection="permissions" createItem={createPermission} vehicles={vehicles} /> : page === "Invitations" ? <AccessManager title="Invitations" collection="invitations" createItem={createInvitation} vehicles={vehicles} /> : page === "Visit History" ? <History visits={allVisits} vehicles={vehicles} /> : page === "Alerts" ? <Alerts alerts={alerts} /> : page === "Password Requests" ? <PasswordRequests /> : page === "Complaints" ? <ComplaintsAdmin /> : <Placeholder page={page} vehicles={vehicles} detections={detections} />;
+  const content2 = page === "Dashboard" ? <Dashboard stats={stats} detections={detections} current={currentDetection} visits={allVisits} cameraOn={cameraOn} toggleCamera={toggleCamera} onDetection={handleLiveDetection} openLookup={() => setManualLookup(true)} /> : page === "Live Monitoring" ? <Live current={currentDetection} cameraOn={cameraOn} toggleCamera={toggleCamera} onDetection={handleLiveDetection} openLookup={() => setManualLookup(true)} /> : page === "Vehicles" ? (selectedPlate ? <Profile plate={selectedPlate} vehicles={vehicles} detections={detections} nav={nav} /> : <Vehicles vehicles={debouncedQuery ? searchVehiclesSync(debouncedQuery) : vehicles} query={query} setQuery={setQuery} nav={nav} notify={notify} select={setSelectedPlate} />) : page === "Register Vehicle" ? <Registration nav={nav} notify={notify} vehicles={vehicles} /> : page === "Vehicle Verification Center" ? <Validator vehicles={vehicles} nav={nav} /> : page === "Reports" ? <Reports vehicles={vehicles} visits={allVisits} detections={detections} /> : page === "Analytics" ? <Analytics vehicles={vehicles} visits={allVisits} detections={detections} /> : page === "Settings" ? <Diagnostics cameraOn={cameraOn} toggleCamera={toggleCamera} aiOnline={aiOnline} /> : page === "Permissions" ? <AccessManager title="Permissions" collection="permissions" createItem={createPermission} vehicles={vehicles} /> : page === "Invitations" ? <AccessManager title="Invitations" collection="invitations" createItem={createInvitation} vehicles={vehicles} /> : page === "Visit History" ? <History visits={allVisits} vehicles={vehicles} /> : page === "Alerts" ? <Alerts alerts={alerts} /> : page === "Password Requests" ? <PasswordRequests /> : page === "Complaints" ? <ComplaintsAdmin /> : <Placeholder page={page} vehicles={vehicles} detections={detections} />;
   const liveSignal = aiOnline ? (cameraOn ? "AI Processing Active" : "AI Standby") : cameraOn ? "Camera On \u00b7 AI Offline" : "System Idle";
-  return <div className="app-shell"><CyberBackground variant="admin" /><aside className="sidebar"><div className="brand"><div className="brand-mark"><LogoMark theme="admin" size={44} /></div><div className="brand-copy"><strong>NexPlate</strong><span>Intelligent Vehicle Access</span></div></div><nav>{navItems.map((item) => { const Icon = navIcons[item] || List; return <motion.button whileTap={{ scale: 0.97 }} className={page === item ? "active" : ""} onClick={() => nav(item)} key={item} title={item}><Icon size={15} /><span className="nav-label">{item}</span></motion.button>; })}</nav><div className="sidebar-foot"><span className="pulse" /> Admin · {currentUser.displayName}</div></aside><main><header className="top-status-bar"><h1 className="status-title">{page}</h1><div className="status-bar-right"><span className={`status-pill ${aiOnline ? "online" : ""}`}><span className="live-dot" />{liveSignal}</span><span className="admin-badge">ADMIN</span><button className="signout-btn" onClick={handleLogout}>Sign out</button></div></header><AnimatePresence mode="wait"><motion.div key={page} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} transition={{ duration: prefersReduced ? 0 : 0.22 }}>{content2}</motion.div></AnimatePresence></main>{manualLookup && <ManualLookup close={() => setManualLookup(false)} />}{toast && <div className="toast"><Activity size={16} /> {toast}</div>}</div>;
+  return (
+    <div className="app-shell">
+      <CyberBackground variant="admin" />
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark"><LogoMark theme="admin" size={44} /></div>
+          <div className="brand-copy">
+            <strong>NexPlate</strong>
+            <span>Intelligent Vehicle Access</span>
+          </div>
+        </div>
+        <nav className="sidebar-nav-grouped">
+          {navGroups.map((group) => (
+            <div key={group.title} className="nav-group">
+              <div className="nav-group-header">{group.title}</div>
+              <div className="nav-group-items">
+                {group.items.map((item) => {
+                  const Icon = item.icon || List;
+                  const isActive = page === item.id;
+                  return (
+                    <motion.button
+                      whileTap={{ scale: 0.97 }}
+                      className={isActive ? "active" : ""}
+                      onClick={() => nav(item.id)}
+                      key={item.id}
+                      title={item.label}
+                    >
+                      <Icon size={15} />
+                      <span className="nav-label">{item.label}</span>
+                      {item.badge && <span className="nav-badge-live">{item.badge}</span>}
+                    </motion.button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </nav>
+        <div className="sidebar-foot"><span className="pulse" /> Admin · {currentUser.displayName}</div>
+      </aside>
+      <main>
+        <header className="top-status-bar">
+          <h1 className="status-title">{page}</h1>
+          <label className="mobile-page-menu">
+            <span>Menu</span>
+            <select aria-label="Admin page" value={page} onChange={(event) => nav(event.target.value)}>
+              {navItems.map((item) => <option key={item} value={item}>{item}</option>)}
+            </select>
+          </label>
+          <div className="status-bar-right">
+            <span className={`status-pill ${aiOnline ? "online" : ""}`}>
+              <span className="live-dot" />{liveSignal}
+            </span>
+            <span className="admin-badge">ADMIN</span>
+            <button className="signout-btn" onClick={handleLogout}>Sign out</button>
+          </div>
+        </header>
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={page}
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            transition={{ duration: prefersReduced ? 0 : 0.22 }}
+          >
+            {content2}
+          </motion.div>
+        </AnimatePresence>
+      </main>
+      {manualLookup && <ManualLookup close={() => setManualLookup(false)} />}
+      {toast && <div className="toast"><Activity size={16} /> {toast}</div>}
+    </div>
+  );
+}
+
+const INDIAN_STATES = {
+  AP: "Andhra Pradesh", AR: "Arunachal Pradesh", AS: "Assam", BR: "Bihar",
+  CG: "Chhattisgarh", CH: "Chandigarh", DD: "Daman & Diu", DL: "Delhi NCT",
+  DN: "Dadra & Nagar Haveli", GA: "Goa", GJ: "Gujarat", HP: "Himachal Pradesh",
+  HR: "Haryana", JH: "Jharkhand", JK: "Jammu & Kashmir", KA: "Karnataka",
+  KL: "Kerala", LA: "Ladakh", LD: "Lakshadweep", MH: "Maharashtra",
+  ML: "Meghalaya", MN: "Manipur", MP: "Madhya Pradesh", MZ: "Mizoram",
+  NL: "Nagaland", OD: "Odisha", PB: "Punjab", PY: "Puducherry",
+  RJ: "Rajasthan", SK: "Sikkim", TN: "Tamil Nadu", TR: "Tripura",
+  TS: "Telangana", UK: "Uttarakhand", UP: "Uttar Pradesh", WB: "West Bengal"
+};
+
+function resolvePlateCategory(cleanPlate) {
+  const p = String(cleanPlate || "").toUpperCase();
+  if (p.includes("GOVT") || p.startsWith("DL01") || p.startsWith("MH01") || p.endsWith("0001")) {
+    return { name: "GOVERNMENT OFFICIAL", color: "#DC2626", text: "#FFFFFF", badge: "GOVT SEAL" };
+  }
+  if (p.endsWith("7777") || p.endsWith("0007") || p.endsWith("9999") || p.includes("VIP")) {
+    return { name: "VIP / DIGNITARY", color: "#D97706", text: "#FEF3C7", badge: "GOLD EMBOSSED" };
+  }
+  if (p.includes("EV") || p.includes("E1") || p.includes("E2")) {
+    return { name: "ELECTRIC VEHICLE (EV)", color: "#16A34A", text: "#FFFFFF", badge: "ZERO EMISSION" };
+  }
+  if (p.includes("T") || p.includes("TX") || p.includes("CT") || p.includes("TR")) {
+    return { name: "COMMERCIAL TRANSPORT", color: "#EAB308", text: "#0F172A", badge: "CARGO / TAXI" };
+  }
+  if (p.startsWith("CD") || p.startsWith("CC") || p.startsWith("UN")) {
+    return { name: "DIPLOMATIC MISSION", color: "#2563EB", text: "#FFFFFF", badge: "EMBASSY" };
+  }
+  return { name: "PRIVATE PASSENGER", color: "#FFFFFF", text: "#0F172A", badge: "STANDARD HSRP" };
 }
 
 function LoginScreen({ onLogin }) {
@@ -235,20 +431,16 @@ function LoginScreen({ onLogin }) {
   const [role, setRole] = useState("CUSTOMER");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [otp, setOtp] = useState(["", "", "", "", "", ""]);
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [forgotOpen, setForgotOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const otpRefs = useRef([]);
   const customer = role === "CUSTOMER";
 
   const submit = async (event) => {
     event.preventDefault();
     if (loading) return;
-    if (customer && !isIndianPlateFormat(username)) return setError("Enter a valid Indian vehicle number.");
-    const demoAdminBypass = !customer && ["admin", "admin@nexplate.internal"].includes(String(username || "").trim().toLowerCase());
-    if (!customer && !demoAdminBypass && otp.join("").length !== 6) return setError("Enter the 6-digit verification code.");
+    if (customer && !isIndianPlateFormat(username)) return setError("Please enter a valid Indian vehicle number (e.g. AP12AB1234).");
     setError("");
     setLoading(true);
     try {
@@ -256,7 +448,6 @@ function LoginScreen({ onLogin }) {
       const user = {
         id: result.user.id,
         username: customer ? normalizePlate(username) : username,
-        password,
         role: result.user.role,
         displayName: result.user.display_name,
         plateNumber: result.user.plate_number || null,
@@ -265,7 +456,7 @@ function LoginScreen({ onLogin }) {
         source: "SUPABASE",
       };
       onLogin(user);
-      navigate(user.role === "CUSTOMER" ? "/customer" : "/dashboard", { replace: true });
+      navigate(user.role === "CUSTOMER" ? "/customer/dashboard" : "/dashboard", { replace: true });
       window.dispatchEvent(new CustomEvent("app-user-authenticated", { detail: user }));
     } catch (loginError) {
       setError(loginError?.message || "Unable to sign in with those details.");
@@ -274,126 +465,128 @@ function LoginScreen({ onLogin }) {
     }
   };
 
-  const changeOtp = (index, value) => {
-    const next = [...otp];
-    next[index] = value.replace(/\D/g, "").slice(-1);
-    setOtp(next);
-    if (next[index] && index < 5) otpRefs.current[index + 1]?.focus();
-  };
-
   const switchRole = (nextRole) => {
     setRole(nextRole);
     setError("");
-    setOtp(["", "", "", "", "", ""]);
     setForgotOpen(false);
   };
 
   return (
-    <main className={`auth-shell ${customer ? "customer-auth" : "admin-auth"}`}>
+    <main className="auth-shell">
       <CyberBackground variant="login" />
 
-      {/* Top Right Luxury Admin Access Lock Button */}
-      <div className="top-right-admin-bar">
-        <button
-          type="button"
-          className={`luxury-admin-lock-btn ${!customer ? "mode-active" : ""}`}
-          onClick={() => switchRole(customer ? "ADMIN" : "CUSTOMER")}
-          title={customer ? "Switch to Security Admin Control" : "Return to Vehicle Customer Access"}
-        >
-          <LockKeyhole size={13} className="admin-lock-icon" />
-          <span className="admin-lock-text">{customer ? "Admin Access" : "Customer Portal"}</span>
-        </button>
-      </div>
+      <section className="login-card-container">
+        <div className="login-brand-header">
+          <div className="login-brand-logo">
+            <LogoMark theme={customer ? "customer" : "admin"} size={42} />
+          </div>
+          <div className="login-brand-titles">
+            <strong>NexPlate</strong>
+            <span>Autonomous Vehicle & LPRS Control</span>
+          </div>
+        </div>
 
-      {!customer && (
-        <div className="admin-status">
-          SECURE ACCESS <span>•</span> AUDITED SESSION
-          <button type="button" className="admin-recovery-trigger" onClick={() => setForgotOpen(true)}>
-            Recovery
+        {/* Unified Role Switcher Tabs */}
+        <div className="login-role-tabs">
+          <button
+            type="button"
+            className={`role-tab ${customer ? "active" : ""}`}
+            onClick={() => switchRole("CUSTOMER")}
+          >
+            <CarFront size={15} /> Customer Portal
+          </button>
+          <button
+            type="button"
+            className={`role-tab ${!customer ? "active" : ""}`}
+            onClick={() => switchRole("ADMIN")}
+          >
+            <ShieldCheck size={15} /> Security Admin
           </button>
         </div>
-      )}
 
-      <section className="auth-panel">
-        <div className="auth-brand">
-          <div className="auth-logo"><LogoMark theme={customer ? "customer" : "admin"} size={48} /></div>
-          <strong>NexPlate</strong>
-        </div>
-
-        <p className="auth-eyebrow">{customer ? "Vehicle Intelligence System" : "Security Command Console"}</p>
-        <h1>{customer ? "Vehicle Access Portal" : "Control Center"}</h1>
-        <p className="auth-subtitle">
-          {customer ? "Enter your registered vehicle number and password to proceed." : "Authorized administrative credentials required."}
+        <p className="login-subtitle">
+          {customer
+            ? "Enter your registered vehicle plate number and password."
+            : "Authorized system administrator credentials required."}
         </p>
 
-        <form className="auth-form" onSubmit={submit}>
-          <label>
-            <span className="auth-input">
-              <CarFront size={17} />
+        <form className="login-form" onSubmit={submit}>
+          <div className="login-form-group">
+            <label className="login-label">
+              {customer ? "Vehicle Number" : "Administrator ID"}
+            </label>
+            <div className="login-input-wrap">
+              {customer ? (
+                <CarFront size={16} className="login-input-icon" />
+              ) : (
+                <ShieldCheck size={16} className="login-input-icon" />
+              )}
               <input
-                className={`${customer ? "plate-input" : "admin-input"} ${username ? "has-value" : ""}`}
+                className="login-input"
                 value={username}
-                placeholder=" "
-                onChange={(event) => setUsername(customer ? normalizePlate(event.target.value) : event.target.value)}
+                placeholder={customer ? "e.g. AP 12 AB 1234" : "e.g. admin"}
+                onChange={(event) =>
+                  setUsername(customer ? normalizePlate(event.target.value) : event.target.value)
+                }
                 autoComplete="username"
+                required
               />
-              <small className="float-label">{customer ? "Vehicle Number" : "Admin ID"}</small>
-            </span>
-          </label>
+            </div>
+          </div>
 
-          <label>
-            <span className="auth-input">
-              <LockKeyhole size={17} />
+          <div className="login-form-group">
+            <div className="login-label-row">
+              <label className="login-label">Password</label>
+              {customer && (
+                <button
+                  type="button"
+                  className="login-forgot-btn"
+                  onClick={() => setForgotOpen(true)}
+                >
+                  Forgot password?
+                </button>
+              )}
+            </div>
+            <div className="login-input-wrap">
+              <LockKeyhole size={16} className="login-input-icon" />
               <input
                 type={showPassword ? "text" : "password"}
-                className={password ? "has-value" : ""}
+                className="login-input"
                 value={password}
-                placeholder=" "
+                placeholder="Enter password"
                 onChange={(event) => setPassword(event.target.value)}
                 autoComplete="current-password"
+                required
               />
-              <small className="float-label">{customer ? "Password" : "Security Password"}</small>
-              <button type="button" className="password-toggle" onClick={() => setShowPassword((value) => !value)}>
-                {showPassword ? <EyeOff size={15} /> : <Eye size={15} />} {showPassword ? "Hide" : "Show"}
+              <button
+                type="button"
+                className="login-pwd-toggle"
+                onClick={() => setShowPassword((v) => !v)}
+              >
+                {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
               </button>
-            </span>
-          </label>
+            </div>
+          </div>
 
-          {!customer && (
-            <label>
-              6-Digit Security Token
-              <div className="otp-row">
-                {otp.map((digit, index) => (
-                  <input
-                    key={index}
-                    ref={(element) => { otpRefs.current[index] = element; }}
-                    value={digit}
-                    onChange={(event) => changeOtp(index, event.target.value)}
-                    inputMode="numeric"
-                    maxLength={1}
-                    aria-label={`Verification digit ${index + 1}`}
-                  />
-                ))}
-              </div>
-            </label>
-          )}
+          {error && <div className="login-error-alert">{error}</div>}
 
-          {error && <p className="auth-error">{error}</p>}
-
-          <motion.button whileTap={{ scale: 0.97 }} className="auth-submit" type="submit" disabled={loading}>
-            {loading ? "Authenticating..." : customer ? "Access My Dashboard" : "Authenticate & Enter"}
-          </motion.button>
+          <button className="login-submit-btn" type="submit" disabled={loading}>
+            {loading ? "Authenticating..." : customer ? "Access Vehicle Dashboard" : "Authenticate & Sign In"}
+          </button>
         </form>
 
-        {customer && (
-          <button type="button" className="forgot-link" onClick={() => setForgotOpen(true)}>
-            <KeyRound size={14} /> Forgot password?
-          </button>
+        {forgotOpen && (
+          customer ? (
+            <ForgotPassword close={() => setForgotOpen(false)} />
+          ) : (
+            <AdminForgotPassword close={() => setForgotOpen(false)} />
+          )
         )}
-        {forgotOpen && (customer ? <ForgotPassword close={() => setForgotOpen(false)} /> : <AdminForgotPassword close={() => setForgotOpen(false)} />)}
-        <p className="auth-footer">
-          {customer ? "Credential access authorized by facility management." : "All access events logged for regulatory audit."}
-        </p>
+
+        <div className="login-card-footer">
+          <span className="live-dot" />
+          <span>256-BIT ENCRYPTED • LOCAL-FIRST AI INFERENCE</span>
+        </div>
       </section>
     </main>
   );
@@ -406,33 +599,14 @@ const getVehicleIcon = (type = "") => {
   return CarFront;
 };
 
-function VehicleSwitcher({ vehicles, selectedPlate, onSelect, statsByPlate, complaintProps }) {
+function VehicleSwitcher({ vehicles, selectedPlate, onSelect, statsByPlate }) {
   const [open, setOpen] = useState(false);
-  const [support, setSupport] = useState({ category: "GATE_ISSUE", description: "" });
-  const [supportMessage, setSupportMessage] = useState("");
-  const [supportItems, setSupportItems] = useState(() => getCollection("complaints").filter((item) => normalizePlate(item.plate_number || item.plateNumber) === normalizePlate(selectedPlate)));
   const groupRef = useRef(null);
   useEffect(() => {
     const close = (event) => { if (groupRef.current && !groupRef.current.contains(event.target)) setOpen(false); };
     document.addEventListener("mousedown", close);
     return () => document.removeEventListener("mousedown", close);
   }, []);
-  useEffect(() => {
-    const refreshSupport = () => setSupportItems(getCollection("complaints").filter((item) => normalizePlate(item.plate_number || item.plateNumber) === normalizePlate(selectedPlate)));
-    refreshSupport();
-    window.addEventListener("local-data-change", refreshSupport);
-    return () => window.removeEventListener("local-data-change", refreshSupport);
-  }, [selectedPlate]);
-  const submitSupport = async (event) => {
-    event.preventDefault();
-    if (!support.description.trim()) return setSupportMessage("Describe the issue before submitting.");
-    try {
-      const created = await createComplaint({ category: support.category, description: support.description.trim(), plateNumber: selectedPlate });
-      setSupportItems((current) => [created, ...current]);
-      setSupport({ category: "GATE_ISSUE", description: "" });
-      setSupportMessage("Complaint submitted — sent to security admin.");
-    } catch (error) { setSupportMessage(error.message || "Complaint submission failed."); }
-  };
   if (!vehicles.length) return <div className="vehicle-switcher"><span className="switch-label">NO LINKED VEHICLES</span></div>;
   const current = vehicles.find((item) => item.plateNumber === selectedPlate) || vehicles[0];
   const CurrentIcon = getVehicleIcon(current.vehicleType);
@@ -447,25 +621,55 @@ function CustomerComplaintsPanel({ complaints, complaint, setComplaint, saveComp
   return <section className="page-panel customer-complaints"><div className="section-heading"><div><p className="eyebrow">Support</p><h2>Report a Problem</h2></div><span className="table-count">{pendingComplaints.length} active</span></div><form className="form-grid" onSubmit={saveComplaint}><label>Category<select value={complaint.category} onChange={(event) => setComplaint({ ...complaint, category: event.target.value })}><option value="GATE_ISSUE">Gate Issue</option><option value="WRONG_DETECTION">Wrong Detection</option><option value="OTHER">Other Issue</option></select></label><label className="full-width-field">Problem Details<textarea maxLength={500} value={complaint.description} onChange={(event) => setComplaint({ ...complaint, description: event.target.value })} placeholder="Describe the issue in detail..." required /></label><button type="submit" className="primary-btn full-width-field">Submit Complaint</button></form>{complaintMessage && <p className="muted-note text-emerald">{complaintMessage}</p>}{complaints.map((item) => <div className="complaint-item compact" key={item.id}><div className="complaint-head"><span className={`badge ${cls(item.status)}`}>{item.status}</span><small>{item.plate_number || item.plateNumber || "-"}</small></div><p className="complaint-body">{item.description}</p>{item.admin_response && <div className="admin-reply"><strong>Admin Response</strong><p>{item.admin_response}</p></div>}</div>)}</section>;
 }
 
-function CustomerDashboard({ account, onLogout }) {
-  const [vehicles, setVehicles] = useState(() => getAccountVehicles(account));
-  const [selectedPlate, setSelectedPlate] = useState(() => getAccountVehicles(account)[0]?.plateNumber || account.plateNumber);
-  const [invitations, setInvitations] = useState(() => getCollection("invitations").filter((item) => item.createdBy === account.username || item.ownerPlateNumber === account.plateNumber));
-  const [complaints, setComplaints] = useState(() => getCollection("complaints").filter((item) => item.customer_id === account.id || item.createdBy === account.username));
+function CustomerDashboard({ account, onLogout, location, navigate }) {
+  const [vehicles, setVehicles] = useState([]);
+  const [invitations, setInvitations] = useState([]);
+  const [visits, setVisits] = useState([]);
+  const [detections, setDetections] = useState([]);
+  const [complaints, setComplaints] = useState([]);
+  const [dataLoading, setDataLoading] = useState(true);
+  const [dataError, setDataError] = useState("");
+  const [selectedPlate, setSelectedPlate] = useState(account.plateNumber || "");
   const [historyFilter, setHistoryFilter] = useState("ALL"); // "ALL" or specific plate number
+  const [historyPage, setHistoryPage] = useState(1);
   const [selectedCategories, setSelectedCategories] = useState(["Guest Visit"]);
-  const [customerSection, setCustomerSection] = useState("Dashboard");
-  const [customerAlerts, setCustomerAlerts] = useState(() => getCollection("alerts"));
+  const [customerAlerts, setCustomerAlerts] = useState([]);
   const [form, setForm] = useState({ plateNumber: "", vehicleType: "Car", person: "", purpose: "Guest Visit", customPurpose: "", duration: "60", startAt: "", endAt: "" });
   const [complaint, setComplaint] = useState({ category: "GATE_ISSUE", description: "" });
   const [message, setMessage] = useState("");
   const [complaintMessage, setComplaintMessage] = useState("");
+  const [alertMessage, setAlertMessage] = useState("");
+  const refreshInProgress = useRef(false);
+  const customerSection = customerRouteMap[location.pathname] || "Dashboard";
+  const setCustomerSection = (section) => navigate(customerPathForSection[section] || "/customer/dashboard");
 
   const vehicle = vehicles.find((item) => item.plateNumber === selectedPlate) || vehicles[0];
-  const access = evaluateAccessSync(selectedPlate);
-  const evaluateAccess = evaluateAccessSync;
+  const currentTime = Date.now();
+  const activeInvitation = invitations.find((item) => normalizePlate(item.plateNumber) === normalizePlate(selectedPlate)
+    && !["CANCELLED", "EXPIRED", "BLOCKED"].includes(String(item.status || "").toUpperCase())
+    && (!item.startAt || currentTime >= new Date(item.startAt).getTime())
+    && (!item.endAt || currentTime <= new Date(item.endAt).getTime()));
+  const isVehicleValid = vehicle
+    && vehicle.status !== "BLOCKED"
+    && (!vehicle.valid_from && !vehicle.validFrom || currentTime >= new Date(vehicle.valid_from || vehicle.validFrom).getTime())
+    && (!vehicle.valid_until && !vehicle.validUntil || currentTime <= new Date(vehicle.valid_until || vehicle.validUntil).getTime());
+  const access = activeInvitation
+    ? { decision: "AUTHORIZED", reason: "Invitation is valid", invitation: activeInvitation }
+    : isVehicleValid
+      ? { decision: "AUTHORIZED", reason: "Registered vehicle permission is valid", invitation: null }
+      : { decision: "UNAUTHORIZED", reason: vehicle?.status === "BLOCKED" ? "Vehicle is blocked" : "No valid access permission", invitation: null };
   const ownedPlates = new Set(vehicles.map((item) => normalizePlate(item.plateNumber)));
-  const statsByPlate = Object.fromEntries(vehicles.map((item) => [item.plateNumber, getVehicleStats(item.plateNumber)]));
+  const statsByPlate = Object.fromEntries(vehicles.map((item) => {
+    const plate = normalizePlate(item.plateNumber);
+    const plateVisits = visits.filter((visit) => normalizePlate(visit.plateNumber || visit.plate_number) === plate);
+    const plateDetections = detections.filter((detection) => normalizePlate(detection.plateNumber || detection.plate_number) === plate);
+    const durations = plateVisits.map((visit) => Number(visit.durationMinutes || visit.duration_minutes || 0)).filter(Boolean);
+    return [item.plateNumber, {
+      detections: plateDetections.length,
+      visits: plateVisits.length,
+      averageStay: durations.length ? Math.round(durations.reduce((sum, duration) => sum + duration, 0) / durations.length) : 0,
+    }];
+  }));
 
   const invitedVehicles = invitations.map((invitation) => ({
     id: `invitation-${invitation.id}`,
@@ -481,13 +685,13 @@ function CustomerDashboard({ account, onLogout }) {
   const trackedPlates = new Set(trackedVehicles.map((item) => normalizePlate(item.plateNumber)));
   const trackedVehicleByPlate = new Map(trackedVehicles.map((item) => [normalizePlate(item.plateNumber), item]));
   const allAccountHistory = [
-    ...getCollection("visits").filter((item) => trackedPlates.has(normalizePlate(item.plateNumber || item.plate_number))).map((item) => ({
+    ...visits.filter((item) => trackedPlates.has(normalizePlate(item.plateNumber || item.plate_number))).map((item) => ({
       ...item,
       plateNumber: item.plateNumber || item.plate_number,
       entryTime: item.entryTime || item.entry_time || item.timestamp,
       historyType: "Visit",
     })),
-    ...getCollection("detections").filter((item) => trackedPlates.has(normalizePlate(item.plateNumber || item.plate_number))).map((item) => ({
+    ...detections.filter((item) => trackedPlates.has(normalizePlate(item.plateNumber || item.plate_number))).map((item) => ({
       ...item,
       plateNumber: item.plateNumber || item.plate_number,
       entryTime: item.timestamp || item.detected_at,
@@ -506,26 +710,48 @@ function CustomerDashboard({ account, onLogout }) {
   const filteredHistory = historyFilter === "ALL"
     ? uniqueAccountHistory
     : uniqueAccountHistory.filter((item) => normalizePlate(item.plateNumber) === normalizePlate(historyFilter));
+  const historyPageCount = Math.max(1, Math.ceil(filteredHistory.length / 25));
+  const visibleHistory = filteredHistory.slice((Math.min(historyPage, historyPageCount) - 1) * 25, Math.min(historyPage, historyPageCount) * 25);
 
-  const refresh = async () => {
+  const refresh = async (showLoading = false) => {
+    if (refreshInProgress.current) return;
+    refreshInProgress.current = true;
+    if (showLoading) setDataLoading(true);
+    setDataError("");
     try {
-      if (getAccessToken()) await Promise.all([fetchCollectionFromAPI("invitations"), fetchCollectionFromAPI("complaints"), getVehicles().then(() => undefined)]);
-    } catch { }
-    const owned = getAccountVehicles(account);
-    setVehicles(owned);
-    const plates = new Set(owned.map((item) => item.plateNumber));
-    setInvitations(getCollection("invitations").filter((item) => plates.has(item.ownerPlateNumber) || item.createdBy === account.username));
-    setComplaints(getCollection("complaints").filter((item) => item.customer_id === account.id || item.createdBy === account.username));
+      const data = await fetchCustomerPortalData();
+      setVehicles(data.vehicles);
+      setInvitations(data.invitations);
+      setVisits(data.visits);
+      setDetections(data.detections);
+      setCustomerAlerts(data.alerts);
+      setComplaints(data.complaints);
+      setSelectedPlate((current) => data.vehicles.some((item) => normalizePlate(item.plateNumber) === normalizePlate(current))
+        ? current
+        : data.vehicles[0]?.plateNumber || "");
+    } catch (error) {
+      if (error.status === 401) {
+        onLogout();
+        return;
+      }
+      setDataError(error.message || "Could not load customer data from the database.");
+    } finally {
+      setDataLoading(false);
+      refreshInProgress.current = false;
+    }
   };
 
   useEffect(() => {
-    refresh();
-    getComplaints().then(refresh).catch(() => refresh());
-    const update = () => refresh();
-    window.addEventListener("local-data-change", update);
-    return () => window.removeEventListener("local-data-change", update);
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 30000);
+    const refreshOnFocus = () => { if (document.visibilityState === "visible") void refresh(); };
+    document.addEventListener("visibilitychange", refreshOnFocus);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account]);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshOnFocus);
+    };
+  }, [account.id]);
 
   const updateStart = (startAt, duration = form.duration) => setForm({ ...form, startAt, endAt: startAt && Number(duration) > 0 ? toDateTimeLocal(new Date(new Date(startAt).getTime() + Number(duration) * 60000)) : form.endAt });
 
@@ -558,7 +784,7 @@ function CustomerDashboard({ account, onLogout }) {
     }
 
     try {
-      const savedInvitations = await createInvitation({
+      await createInvitation({
         ...form,
         person: form.person.trim(),
         purpose: finalPurpose,
@@ -568,7 +794,7 @@ function CustomerDashboard({ account, onLogout }) {
         status: "ACTIVE",
         source: "REAL"
       });
-      setInvitations(savedInvitations.filter((item) => ownedPlates.has(normalizePlate(item.ownerPlateNumber)) || item.createdBy === account.username));
+      await refresh();
       setForm({ plateNumber: "", vehicleType: "Car", person: "", purpose: "Guest Visit", customPurpose: "", duration: "60", startAt: "", endAt: "" });
       setSelectedCategories(["Guest Visit"]);
       setMessage("Guest invitation created & synchronized to AI camera gateway!");
@@ -579,7 +805,7 @@ function CustomerDashboard({ account, onLogout }) {
     event.preventDefault();
     if (!complaint.description.trim()) return setComplaintMessage("Please enter problem details.");
     try {
-      const saved = await createComplaint({
+      await createComplaint({
         category: complaint.category,
         description: complaint.description.trim(),
         customer_id: account.id,
@@ -587,7 +813,7 @@ function CustomerDashboard({ account, onLogout }) {
         createdBy: account.username,
         status: "OPEN"
       });
-      setComplaints((prev) => [saved, ...prev]);
+      await refresh();
       setComplaint({ category: "GATE_ISSUE", description: "" });
       setComplaintMessage("Complaint submitted to security admin successfully!");
     } catch (err) {
@@ -609,7 +835,7 @@ function CustomerDashboard({ account, onLogout }) {
   ];
 
   const pendingComplaints = complaints.filter((item) => ["OPEN", "IN_REVIEW"].includes(item.status));
-  const visibleAlerts = customerAlerts.filter((item) => trackedPlates.has(normalizePlate(item.plateNumber || item.plate_number)) || item.createdBy === account.username);
+  const visibleAlerts = customerAlerts;
   const customerReportVehicles = trackedVehicles;
   const customerReportVisits = uniqueAccountHistory.filter((item) => item.historyType === "Visit");
   const downloadCustomerBackup = () => {
@@ -625,13 +851,18 @@ function CustomerDashboard({ account, onLogout }) {
     const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
     const link = document.createElement("a");
     link.href = url;
-    link.download = `nexplate-customer-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    link.download = `nexplate-customer-database-backup-${new Date().toISOString().slice(0, 10)}.json`;
     link.click();
     URL.revokeObjectURL(url);
   };
   const markCustomerAlertRead = async (alert) => {
-    await markAlertRead(alert.id);
-    setCustomerAlerts(getCollection("alerts"));
+    setAlertMessage("");
+    try {
+      await markAlertRead(alert.id);
+      await refresh();
+    } catch (error) {
+      setAlertMessage(error.message || "Could not mark this alert as read.");
+    }
   };
   const customerNavItems = [
     { id: "Dashboard", label: "Dashboard", Icon: BarChart3 },
@@ -665,7 +896,25 @@ function CustomerDashboard({ account, onLogout }) {
       <nav className="customer-portal-nav" aria-label="Customer portal navigation">
         {customerNavItems.map(({ id, label, Icon }) => <button type="button" key={id} className={customerSection === id ? "active" : ""} aria-current={customerSection === id ? "page" : undefined} onClick={() => setCustomerSection(id)}><Icon size={15} />{label}</button>)}
       </nav>
+      <label className="mobile-page-menu customer-mobile-menu">
+        <span>Menu</span>
+        <select aria-label="Customer portal page" value={customerSection} onChange={(event) => setCustomerSection(event.target.value)}>
+          {customerNavItems.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
+        </select>
+      </label>
 
+      {dataLoading && <section className="page-panel customer-data-state" aria-live="polite" aria-busy="true">
+        <p className="eyebrow">Secure account data</p>
+        <h2>Loading your database records…</h2>
+        <div className="customer-skeleton-grid"><span /><span /><span /></div>
+      </section>}
+      {!dataLoading && dataError && <section className="page-panel customer-data-state" role="alert">
+        <p className="eyebrow">Data connection</p>
+        <h2>Customer data is unavailable</h2>
+        <p>{dataError}</p>
+        <button type="button" className="primary-btn" onClick={() => void refresh(true)}>Retry database connection</button>
+      </section>}
+      {!dataLoading && !dataError && <>
       {customerSection === "Dashboard" && <div className="customer-view">
         <section className="page-panel">
           <div className="section-heading">
@@ -708,28 +957,30 @@ function CustomerDashboard({ account, onLogout }) {
         </section>
         <section className="page-panel"><div className="section-heading"><div><p className="eyebrow">Guest passes</p><h2>My invitations</h2></div><span className="table-count">{invitations.length} total</span></div>
           <div className="table-wrap"><table><thead><tr><th>Visitor vehicle</th><th>Visitor</th><th>Purpose</th><th>Start</th><th>End</th><th>Status</th></tr></thead><tbody>
-            {invitations.map((item) => { const current = evaluateAccess(item.plateNumber); return <tr key={item.id}><td className="plate">{item.plateNumber}</td><td>{item.person || "-"}</td><td>{item.purpose || "-"}</td><td>{item.startAt ? new Date(item.startAt).toLocaleString() : "-"}</td><td>{item.endAt ? new Date(item.endAt).toLocaleString() : "-"}</td><td><span className={`badge ${cls(current.invitation ? "TEMPORARY" : "EXPIRED")}`}>{current.invitation ? "ACTIVE" : "EXPIRED"}</span></td></tr>; })}
+            {invitations.map((item) => { const now = Date.now(); const active = !["CANCELLED", "EXPIRED", "BLOCKED"].includes(String(item.status || "").toUpperCase()) && (!item.startAt || now >= new Date(item.startAt).getTime()) && (!item.endAt || now <= new Date(item.endAt).getTime()); return <tr key={item.id}><td className="plate">{item.plateNumber}</td><td>{item.person || "-"}</td><td>{item.purpose || "-"}</td><td>{item.startAt ? new Date(item.startAt).toLocaleString() : "-"}</td><td>{item.endAt ? new Date(item.endAt).toLocaleString() : "-"}</td><td><span className={`badge ${cls(active ? "TEMPORARY" : "EXPIRED")}`}>{active ? "ACTIVE" : "EXPIRED"}</span></td></tr>; })}
           </tbody></table>{!invitations.length && <div className="empty">No guest invitations yet.</div>}</div>
         </section>
       </div>}
 
       {customerSection === "History" && <section className="page-panel customer-view">
         <div className="section-heading"><div><p className="eyebrow">Entry and exit records</p><h2>Visit history</h2></div><span className="table-count">{filteredHistory.length} records</span></div>
-        <div className="history-filter-pills"><button className={`filter-pill ${historyFilter === "ALL" ? "active" : ""}`} onClick={() => setHistoryFilter("ALL")}>All vehicles ({uniqueAccountHistory.length})</button>{trackedVehicles.map((item) => { const VIcon = getVehicleIcon(item.vehicleType); return <button key={item.id || item.plateNumber} className={`filter-pill ${historyFilter === item.plateNumber ? "active" : ""}`} onClick={() => setHistoryFilter(item.plateNumber)}><VIcon size={14} />{item.plateNumber}</button>; })}</div>
+        <div className="history-filter-pills"><button className={`filter-pill ${historyFilter === "ALL" ? "active" : ""}`} onClick={() => { setHistoryFilter("ALL"); setHistoryPage(1); }}>All vehicles ({uniqueAccountHistory.length})</button>{trackedVehicles.map((item) => { const VIcon = getVehicleIcon(item.vehicleType); return <button key={item.id || item.plateNumber} className={`filter-pill ${historyFilter === item.plateNumber ? "active" : ""}`} onClick={() => { setHistoryFilter(item.plateNumber); setHistoryPage(1); }}><VIcon size={14} />{item.plateNumber}</button>; })}</div>
         <div className="table-wrap"><table><thead><tr><th>Time</th><th>Vehicle type</th><th>Plate</th><th>Source</th><th>Activity</th><th>Registry</th><th>Event status</th></tr></thead><tbody>
-          {filteredHistory.map((item) => { const RowIcon = getVehicleIcon(item.vehicleType); return <tr key={`${item.id}-${item.historyType}-${item.entryTime}`}><td>{clock(item.entryTime || item.timestamp)}</td><td><span className="vehicle-type-tag"><RowIcon size={15} />{item.vehicleType}</span></td><td className="plate">{item.plateNumber}</td><td>{item.vehicleSource}</td><td>{item.historyType}</td><td><span className={`badge ${cls(item.registryStatus)}`}>{item.registryStatus}</span></td><td><span className={`badge ${cls(item.status)}`}>{item.status}</span></td></tr>; })}
+          {visibleHistory.map((item) => { const RowIcon = getVehicleIcon(item.vehicleType); return <tr key={`${item.id}-${item.historyType}-${item.entryTime}`}><td>{clock(item.entryTime || item.timestamp)}</td><td><span className="vehicle-type-tag"><RowIcon size={15} />{item.vehicleType}</span></td><td className="plate">{item.plateNumber}</td><td>{item.vehicleSource}</td><td>{item.historyType}</td><td><span className={`badge ${cls(item.registryStatus)}`}>{item.registryStatus}</span></td><td><span className={`badge ${cls(item.status)}`}>{item.status}</span></td></tr>; })}
         </tbody></table>{!filteredHistory.length && <div className="empty">No records found for this selection.</div>}</div>
+        {historyPageCount > 1 && <div className="pagination-controls" aria-label="Visit history pages"><span>Page {Math.min(historyPage, historyPageCount)} of {historyPageCount}</span><button type="button" disabled={historyPage <= 1} onClick={() => setHistoryPage((current) => Math.max(1, current - 1))}>Previous</button><button type="button" disabled={historyPage >= historyPageCount} onClick={() => setHistoryPage((current) => Math.min(historyPageCount, current + 1))}>Next</button></div>}
       </section>}
 
       {customerSection === "Complaints" && <CustomerComplaintsPanel complaints={complaints} complaint={complaint} setComplaint={setComplaint} saveComplaint={saveComplaint} complaintMessage={complaintMessage} pendingComplaints={pendingComplaints} />}
 
-      {customerSection === "Alerts" && <section className="page-panel customer-view"><div className="section-heading"><div><p className="eyebrow">Account activity</p><h2>Alerts</h2></div><span className="table-count">{visibleAlerts.filter((item) => !item.read).length} unread</span></div>{visibleAlerts.length ? <div className="complaint-list">{visibleAlerts.map((item) => <article className="complaint-item compact" key={item.id}><div className="complaint-head"><span className={`badge ${cls(item.status || item.type || "NOTICE")}`}>{item.status || item.type || "NOTICE"}</span><small>{item.plateNumber || item.plate_number || "Account"}</small><small>{item.timestamp || item.created_at ? new Date(item.timestamp || item.created_at).toLocaleString() : ""}</small></div><p className="complaint-body">{item.message || item.description || item.title || "Account alert"}</p>{!item.read && <button type="button" onClick={() => markCustomerAlertRead(item)}>Mark as read</button>}</article>)}</div> : <div className="empty">No alerts for your linked vehicles or invitations.</div>}</section>}
+      {customerSection === "Alerts" && <section className="page-panel customer-view"><div className="section-heading"><div><p className="eyebrow">Account activity</p><h2>Alerts</h2></div><span className="table-count">{visibleAlerts.filter((item) => !item.read).length} unread</span></div>{alertMessage && <p className="muted-note" role="alert">{alertMessage}</p>}{visibleAlerts.length ? <div className="complaint-list">{visibleAlerts.map((item) => <article className="complaint-item compact" key={item.id}><div className="complaint-head"><span className={`badge ${cls(item.status || item.type || "NOTICE")}`}>{item.status || item.type || "NOTICE"}</span><small>{item.plateNumber || item.plate_number || "Account"}</small><small>{item.timestamp || item.created_at ? new Date(item.timestamp || item.created_at).toLocaleString() : ""}</small></div><p className="complaint-body">{item.message || item.description || item.title || "Account alert"}</p>{!item.read && <button type="button" onClick={() => markCustomerAlertRead(item)}>Mark as read</button>}</article>)}</div> : <div className="empty">No alerts for your linked vehicles or invitations.</div>}</section>}
 
       {customerSection === "Reports" && <div className="customer-view"><Reports vehicles={customerReportVehicles} visits={customerReportVisits} /></div>}
 
       {customerSection === "Settings" && <section className="page-panel customer-view"><div className="section-heading"><div><p className="eyebrow">Account preferences</p><h2>Settings</h2></div></div><div className="profile-grid"><Info title="Customer account" values={[["Username", account.username], ["Display name", ownerDisplayName], ["Primary vehicle", account.plateNumber || "-"], ["Email", account.email || "-"]]} /><Info title="Portal overview" values={[["Registered vehicles", vehicles.length], ["Invitations", invitations.length], ["Open complaints", pendingComplaints.length], ["Unread alerts", visibleAlerts.filter((item) => !item.read).length]]} /></div></section>}
 
-      {customerSection === "Backup" && <section className="page-panel customer-view"><div className="section-heading"><div><p className="eyebrow">Your data</p><h2>Backup</h2></div><button type="button" className="primary-btn" onClick={downloadCustomerBackup}><Download size={15} /> Download backup</button></div><p className="muted-sm">Export a local JSON copy of your account profile, registered vehicles, guest invitations, visit history, complaints, and alerts.</p><div className="profile-grid"><Info title="Included" values={[["Vehicles", vehicles.length], ["Invitations", invitations.length], ["History records", uniqueAccountHistory.length], ["Complaints", complaints.length], ["Alerts", visibleAlerts.length]]} /></div></section>}
+      {customerSection === "Backup" && <section className="page-panel customer-view"><div className="section-heading"><div><p className="eyebrow">Your data</p><h2>Backup</h2></div><button type="button" className="primary-btn" onClick={downloadCustomerBackup}><Download size={15} /> Download backup</button></div><p className="muted-sm">Download a JSON copy of your account profile and database records for linked vehicles, guest invitations, visit history, complaints, and alerts.</p><div className="profile-grid"><Info title="Included" values={[["Vehicles", vehicles.length], ["Invitations", invitations.length], ["History records", uniqueAccountHistory.length], ["Complaints", complaints.length], ["Alerts", visibleAlerts.length]]} /></div></section>}
+      </>}
     </main>
   </div>;
 }
@@ -750,30 +1001,154 @@ function ForgotPassword({ close }) {
       setError(err.message || "Request failed. Is the backend running?");
     }
   };
-  return <div className="lookup-backdrop" onMouseDown={(event) => event.target === event.currentTarget && close()}><motion.section className="lookup-modal forgot-modal" initial={prefersReduced ? false : { opacity: 0, y: 22, scale: 0.98 }} animate={prefersReduced ? {} : { opacity: 1, y: 0, scale: 1 }} transition={{ type: "spring", stiffness: 340, damping: 26 }}><div className="section-heading"><div><p className="eyebrow">Account recovery</p><h2>Request a password reset</h2></div><button className="icon-button" onClick={close}><X size={18} /></button></div>{sent ? <div className="reset-confirm"><CheckCircle2 size={30} /><h3>Request submitted</h3><p>An admin will review this request. After approval, Supabase sends the reset link to the registered customer email.</p><button onClick={close}>Done</button></div> : <form className="form-grid" onSubmit={submit}><label>Vehicle number<input value={form.plateNumber} onChange={(event) => setForm({ ...form, plateNumber: event.target.value })} placeholder="AP12A1234" required /></label><label>Owner name<input value={form.ownerName} onChange={(event) => setForm({ ...form, ownerName: event.target.value })} placeholder="As registered on the vehicle" required /></label>{error && <p className="auth-error">{error}</p>}<button className="auth-submit" type="submit"><KeyRound size={15} /> Submit for approval</button><p className="muted-sm">The reset link is sent only after admin approval.</p></form>}</motion.section></div>;
+  return createPortal(
+    <div className="lookup-backdrop" onMouseDown={(event) => event.target === event.currentTarget && close()}>
+      <motion.section
+        className="lookup-modal forgot-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="customer-recovery-title"
+        initial={prefersReduced ? false : { opacity: 0, y: 22, scale: 0.98 }}
+        animate={prefersReduced ? {} : { opacity: 1, y: 0, scale: 1 }}
+        transition={{ type: "spring", stiffness: 340, damping: 26 }}
+      >
+        <div className="section-heading">
+          <div><p className="eyebrow">Account recovery</p><h2 id="customer-recovery-title">Request a password reset</h2></div>
+          <button type="button" className="icon-button" aria-label="Close account recovery" onClick={close}><X size={18} /></button>
+        </div>
+        {sent ? (
+          <div className="reset-confirm">
+            <CheckCircle2 size={30} />
+            <h3>Request submitted</h3>
+            <p>An admin will review this request. After approval, Supabase sends the reset link to the registered customer email.</p>
+            <button type="button" onClick={close}>Done</button>
+          </div>
+        ) : (
+          <form className="form-grid" onSubmit={submit}>
+            <label>Vehicle number<input value={form.plateNumber} onChange={(event) => setForm({ ...form, plateNumber: event.target.value })} placeholder="AP12A1234" required /></label>
+            <label>Owner name<input value={form.ownerName} onChange={(event) => setForm({ ...form, ownerName: event.target.value })} placeholder="As registered on the vehicle" required /></label>
+            {error && <p className="auth-error" role="alert">{error}</p>}
+            <button className="auth-submit" type="submit"><KeyRound size={15} /> Submit for approval</button>
+            <p className="muted-sm">The reset link is sent only after admin approval.</p>
+          </form>
+        )}
+      </motion.section>
+    </div>,
+    document.body,
+  );
 }
 
 function AdminForgotPassword({ close }) {
   const [form, setForm] = useState({ adminId: "", displayName: "" });
   const [error, setError] = useState("");
   const [done, setDone] = useState(false);
+  const prefersReduced = useReducedMotion();
   const submit = async (event) => {
     event.preventDefault();
     setError("");
     try { await resetAdminPassword(form); setDone(true); } catch (err) { setError(err.message || "The password-reset request could not be sent."); }
   };
-  return <div className="lookup-backdrop" onMouseDown={(event) => event.target === event.currentTarget && close()}><motion.section className="lookup-modal forgot-modal" initial={{ opacity: 0, y: 22 }} animate={{ opacity: 1, y: 0 }}><div className="section-heading"><div><p className="eyebrow">Admin recovery</p><h2>Request a secure reset</h2></div><button className="icon-button" onClick={close}><X size={18} /></button></div>{done ? <div className="reset-confirm"><CheckCircle2 size={30} /><h3>Check your email</h3><p>If the account details match, a password-reset link was sent to the registered email address.</p><button onClick={close}>Done</button></div> : <form className="form-grid" onSubmit={submit}><label>Admin ID or email<input value={form.adminId} onChange={(event) => setForm({ ...form, adminId: event.target.value })} placeholder="admin@nexplate.internal" required /></label><label>Registered name<input value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} placeholder="Your admin display name" required /></label>{error && <p className="auth-error">{error}</p>}<button className="auth-submit" type="submit"><KeyRound size={15} /> Send secure reset link</button><p className="muted-sm">For your security, passwords are changed only through the verified email link.</p></form>}</motion.section></div>;
+  return createPortal(
+    <div className="lookup-backdrop" onMouseDown={(event) => event.target === event.currentTarget && close()}>
+      <motion.section
+        className="lookup-modal forgot-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="admin-recovery-title"
+        initial={prefersReduced ? false : { opacity: 0, y: 22, scale: 0.98 }}
+        animate={prefersReduced ? {} : { opacity: 1, y: 0, scale: 1 }}
+        transition={{ type: "spring", stiffness: 340, damping: 26 }}
+      >
+        <div className="section-heading">
+          <div><p className="eyebrow">Admin recovery</p><h2 id="admin-recovery-title">Request a secure reset</h2></div>
+          <button type="button" className="icon-button" aria-label="Close admin recovery" onClick={close}><X size={18} /></button>
+        </div>
+        {done ? (
+          <div className="reset-confirm">
+            <CheckCircle2 size={30} />
+            <h3>Check your email</h3>
+            <p>If the account details match, a password-reset link was sent to the registered email address.</p>
+            <button type="button" onClick={close}>Done</button>
+          </div>
+        ) : (
+          <form className="form-grid" onSubmit={submit}>
+            <label>Admin ID or email<input value={form.adminId} onChange={(event) => setForm({ ...form, adminId: event.target.value })} placeholder="admin@nexplate.internal" required /></label>
+            <label>Registered name<input value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} placeholder="Your admin display name" required /></label>
+            {error && <p className="auth-error" role="alert">{error}</p>}
+            <button className="auth-submit" type="submit"><KeyRound size={15} /> Send secure reset link</button>
+            <p className="muted-sm">For your security, passwords are changed only through the verified email link.</p>
+          </form>
+        )}
+      </motion.section>
+    </div>,
+    document.body,
+  );
 }
 function PasswordRequests() {
   const [requests, setRequests] = useState([]);
   const [message, setMessage] = useState("");
-  const load = () => getPasswordResetRequests().then(setRequests).catch(() => { });
-  useEffect(() => { load(); }, []);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const load = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setRequests(await getPasswordResetRequests());
+    } catch (loadError) {
+      setError(loadError.message || "Password reset requests could not be loaded.");
+    } finally {
+      setLoading(false);
+    }
+  };
+  useEffect(() => { void load(); }, []);
   const resolve = async (id, action) => {
     setMessage("");
-    try { await resolvePasswordReset(id, action); setMessage(action === "APPROVED" ? "Password updated and request approved." : "Request rejected."); load(); } catch (error) { setMessage(error.message || "Action failed"); }
+    try {
+      await resolvePasswordReset(id, action);
+      setMessage(action === "APPROVED" ? "Reset link sent; request approved." : "Request rejected.");
+      await load();
+    } catch (resolveError) {
+      setMessage(resolveError.message || "The password reset request could not be updated.");
+    }
   };
-  return <section className="page-panel"><div className="section-heading"><div><p className="eyebrow">Approval queue</p><h2>Password reset requests <span className="demo-chip">{requests.filter((item) => item.status === "PENDING").length} PENDING</span></h2></div></div>{message && <p className="muted-note">{message}</p>}<div className="table-wrap"><table><thead><tr><th>Vehicle</th><th>Owner</th><th>Requested</th><th>Status</th><th>Actions</th></tr></thead><tbody>{requests.map((item) => <tr key={item.id}><td className="plate">{item.plate_number}</td><td>{item.owner_name}</td><td>{new Date(item.created_at).toLocaleString()}</td><td><span className={`badge ${cls(item.status)}`}>{item.status}</span></td><td className="table-actions">{item.status === "PENDING" ? <><button onClick={() => resolve(item.id, "APPROVED")}><CheckCircle2 size={13} /> Approve</button><button className="danger" onClick={() => resolve(item.id, "REJECTED")}><XCircle size={13} /> Reject</button></> : <span className="muted-sm">Resolved</span>}</td></tr>)}</tbody></table>{!requests.length && <div className="empty">No password reset requests yet.</div>}</div></section>;
+  return (
+    <section className="page-panel">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Approval queue</p>
+          <h2>Password reset requests <span className="demo-chip">{loading ? "LOADING" : `${requests.filter((item) => item.status === "PENDING").length} PENDING`}</span></h2>
+        </div>
+        {!loading && <button type="button" className="secondary-btn" onClick={() => void load()}>Refresh</button>}
+      </div>
+      {message && <p className="muted-note" role="status">{message}</p>}
+      {error && <p className="muted-note" role="alert">{error} <button type="button" className="secondary-btn" onClick={() => void load()}>Retry</button></p>}
+      {loading && <p className="muted-note" role="status">Loading password reset requests...</p>}
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>Vehicle</th><th>Owner</th><th>Requested</th><th>Status</th><th>Actions</th></tr></thead>
+          <tbody>
+            {loading
+              ? Array.from({ length: 3 }, (_, index) => <tr key={`loading-${index}`} aria-hidden="true"><td colSpan={5}><span className="skeleton-row table-skeleton-bar" /></td></tr>)
+              : requests.map((item) => (
+                <tr key={item.id}>
+                  <td className="plate">{item.plate_number}</td>
+                  <td>{item.owner_name}</td>
+                  <td>{new Date(item.created_at).toLocaleString()}</td>
+                  <td><span className={`badge ${cls(item.status)}`}>{item.status}</span></td>
+                  <td className="table-actions">
+                    {item.status === "PENDING" ? <>
+                      <button type="button" onClick={() => resolve(item.id, "APPROVED")}><CheckCircle2 size={13} /> Approve</button>
+                      <button type="button" className="danger" onClick={() => resolve(item.id, "REJECTED")}><XCircle size={13} /> Reject</button>
+                    </> : <span className="muted-sm">Resolved</span>}
+                  </td>
+                </tr>
+              ))}
+          </tbody>
+        </table>
+        {!loading && !error && !requests.length && <div className="empty">No password reset requests yet.</div>}
+      </div>
+    </section>
+  );
 }
 
 function ComplaintsAdmin() {
@@ -907,7 +1282,35 @@ function ManualLookup({ close }) {
       setLoading(false);
     }
   };
-  return <div className="lookup-backdrop" ref={backdropRef} onMouseDown={(event) => event.target === event.currentTarget && close()}><motion.section className="lookup-modal" initial={prefersReduced ? false : { opacity: 0, y: 22, scale: 0.98 }} animate={prefersReduced ? {} : { opacity: 1, y: 0, scale: 1 }} transition={{ type: "spring", stiffness: 340, damping: 26 }} drag={!prefersReduced} dragConstraints={backdropRef} dragElastic={0.1} dragMomentum={false} dragTransition={{ bounceStiffness: 320, bounceDamping: 24 }}><div className="section-heading"><div><p className="eyebrow">Manual fallback</p><h2>Identify vehicle</h2></div><button className="icon-button" onClick={close}><X size={18} /></button></div><form className="lookup-form" onSubmit={search}><input autoFocus value={plate} onChange={(event) => setPlate(event.target.value)} placeholder="ENTER PLATE NUMBER" /><button type="submit"><Search size={15} /> {loading ? "Searching" : "Identify"}</button></form>{result && <div className={`lookup-result ${String(result.status).toLowerCase()}`}><strong>{result.category || result.status}</strong><div className="lookup-grid">{["id", "plateNumber", "vehicleType", "make", "model", "color", "ownerName", "ownerPhone", "driverName", "driverPhone", "purpose", "accessType", "status"].map((field) => <div key={field}><span>{field}</span><b>{upper(result[field])}</b></div>)}</div></div>}</motion.section></div>;
+  return createPortal(
+    <div className="lookup-backdrop" ref={backdropRef} onMouseDown={(event) => event.target === event.currentTarget && close()}>
+      <motion.section
+        className="lookup-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="vehicle-lookup-title"
+        initial={prefersReduced ? false : { opacity: 0, y: 22, scale: 0.98 }}
+        animate={prefersReduced ? {} : { opacity: 1, y: 0, scale: 1 }}
+        transition={{ type: "spring", stiffness: 340, damping: 26 }}
+        drag={!prefersReduced}
+        dragConstraints={backdropRef}
+        dragElastic={0.1}
+        dragMomentum={false}
+        dragTransition={{ bounceStiffness: 320, bounceDamping: 24 }}
+      >
+        <div className="section-heading">
+          <div><p className="eyebrow">Manual fallback</p><h2 id="vehicle-lookup-title">Identify vehicle</h2></div>
+          <button type="button" className="icon-button" aria-label="Close vehicle lookup" onClick={close}><X size={18} /></button>
+        </div>
+        <form className="lookup-form" onSubmit={search}>
+          <input autoFocus value={plate} onChange={(event) => setPlate(event.target.value)} placeholder="ENTER PLATE NUMBER" />
+          <button type="submit"><Search size={15} /> {loading ? "Searching" : "Identify"}</button>
+        </form>
+        {result && <div className={`lookup-result ${String(result.status).toLowerCase()}`}><strong>{result.category || result.status}</strong><div className="lookup-grid">{["id", "plateNumber", "vehicleType", "make", "model", "color", "ownerName", "ownerPhone", "driverName", "driverPhone", "purpose", "accessType", "status"].map((field) => <div key={field}><span>{field}</span><b>{upper(result[field])}</b></div>)}</div></div>}
+      </motion.section>
+    </div>,
+    document.body,
+  );
 }
 
 function Camera({ cameraOn, toggleCamera, onDetection }) {
@@ -1078,28 +1481,291 @@ function Camera({ cameraOn, toggleCamera, onDetection }) {
   const measureRows = [["Capture", timings.browser_capture_ms], ["Encode", timings.browser_encode_ms], ["Vehicle", timings.vehicle_detection_ms], ["Plate", timings.plate_detection_ms], ["OCR", timings.ocr_ms], ["Consensus", timings.consensus_ms], ["Database", timings.backend_persist_ms], ["Round trip", timings.browser_total_ms]];
   const readoutText = frameResult?.raw_ocr || frameResult?.rawOcr || frameResult?.plate || frameResult?.plateNumber || "Waiting for a plate read";
   const readoutStatus = frameResult?.persistence_error || frameResult?.reason || frameResult?.status || "Scanning";
-  return <div className="camera-panel"><div className="section-heading"><div><p className="eyebrow">Browser camera input</p><h2>Camera monitor <span className={`status-pill camera-state ${statusClass}`}><span className="live-dot" />{cameraBadge}</span></h2></div><div className="camera-controls"><button className={`camera-toggle ${cameraOn ? "on" : ""}`} onClick={toggleCamera}>{cameraOn ? <Video size={14} /> : <VideoOff size={14} />} Camera {cameraOn ? "ON" : "OFF"}</button>{cameraOn && <button className="icon-button" onClick={restartCamera} title="Restart camera"><Video size={14} /> Restart</button>}</div></div>{cameras.length > 1 && <div className="camera-selector"><label>Camera source<select value={selectedCamera} onChange={(event) => setSelectedCamera(event.target.value)}>{cameras.map((camera) => <option key={camera.deviceId} value={camera.deviceId}>{camera.label}</option>)}</select></label></div>}<div className={`camera-stage ${cameraOn && !error ? "camera-live" : ""}`}>{cameraOn && !error ? <><video ref={videoRef} autoPlay playsInline muted /><div className="camera-overlay"><span><span className="live-dot" /> WEB CAMERA LIVE</span><small className={engineClass}>{engineNote}</small></div>{frameResult && <><svg className="camera-detection-boxes" viewBox={`0 0 ${frameWidth} ${frameHeight}`} preserveAspectRatio="xMidYMid slice" role="img" aria-label="Live vehicle and plate detection boxes">{vehicleBox && <g><rect x={vehicleBox[0]} y={vehicleBox[1]} width={vehicleBox[2] - vehicleBox[0]} height={vehicleBox[3] - vehicleBox[1]} className="vehicle-detection-box" /><text x={vehicleBox[0] + 4} y={Math.max(18, vehicleBox[1] - 6)} className="vehicle-detection-label">{frameResult.vehicle_type || "Vehicle"}</text></g>}{plateBox && <g><rect x={plateBox[0]} y={plateBox[1]} width={plateBox[2] - plateBox[0]} height={plateBox[3] - plateBox[1]} className="plate-detection-box" /><text x={plateBox[0] + 4} y={Math.max(18, plateBox[1] - 6)} className="plate-detection-label">PLATE</text></g>}</svg><div className="camera-readout" aria-live="polite"><div className="camera-readout-heading"><strong>{upper(readoutText)}{frameResult?.plate_width_pixels ? ` · ${frameResult.plate_width_pixels}px` : ""}</strong><span>{upper(readoutStatus)}{frameResult?.ocr_confidence ? ` · ${(Number(frameResult.ocr_confidence) * 100).toFixed(1)}%` : ""}{frameResult?.decision ? ` · ${upper(frameResult.decision)}` : ""}{frameResult?.persisted === false && frameResult?.persistence_error ? " · NOT SAVED" : ""}</span></div><div className="camera-timing-grid">{[["OCR load", startupTimings?.ocr_model_load_ms], ["Plate model load", startupTimings?.plate_model_load_ms], ...measureRows].filter(([, value]) => value !== undefined && value !== null).map(([label, value]) => <span key={label}>{label} <b>{(Number(value) / 1000).toFixed(2)}s</b></span>)}</div></div></>}<div className="camera-stats"><span>{resolution || "connecting..."}</span><span>~{fps} fps</span></div></> : <><CarFront size={52} /><p>{cameraOn ? "Camera unavailable" : "Camera is OFF"}</p><small>{cameraOn ? error || "TURN THE CAMERA ON TO REQUEST YOUR LAPTOP WEBCAM." : "TURN THE CAMERA ON TO REQUEST YOUR LAPTOP WEBCAM."}</small></>}</div></div>;
+  const styling = frameResult?.plate_styling || null;
+  const plateCategory = frameResult?.plate_category || styling?.category || "PRIVATE";
+  const plateBg = frameResult?.plate_bg_hex || styling?.bg_hex || "#6366F1";
+  const plateText = frameResult?.plate_text_hex || styling?.text_hex || "#FFFFFF";
+
+  return (
+    <div className="camera-panel oled-chassis">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Realtime Optical Sensor</p>
+          <h2>
+            Camera monitor{" "}
+            <span className={`status-pill camera-state ${statusClass}`}>
+              <span className="live-dot" />
+              {cameraBadge}
+            </span>
+          </h2>
+        </div>
+        <div className="camera-controls">
+          <button className={`camera-toggle ${cameraOn ? "on" : ""}`} onClick={toggleCamera}>
+            {cameraOn ? <Video size={14} /> : <VideoOff size={14} />} Camera {cameraOn ? "ON" : "OFF"}
+          </button>
+          {cameraOn && (
+            <button className="icon-button" onClick={restartCamera} title="Restart camera">
+              <Video size={14} /> Restart
+            </button>
+          )}
+        </div>
+      </div>
+      {cameras.length > 1 && (
+        <div className="camera-selector">
+          <label>
+            Camera source
+            <select value={selectedCamera} onChange={(event) => setSelectedCamera(event.target.value)}>
+              {cameras.map((camera) => (
+                <option key={camera.deviceId} value={camera.deviceId}>
+                  {camera.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
+      <div className={`camera-stage ${cameraOn && !error ? "camera-live oled-feed-active" : ""}`}>
+        {cameraOn && !error ? (
+          <>
+            <video ref={videoRef} autoPlay playsInline muted className="hardware-video-stream" />
+
+            {/* Tactical Military Reticle Brackets */}
+            <div className="hud-corner-bracket top-left" />
+            <div className="hud-corner-bracket top-right" />
+            <div className="hud-corner-bracket bottom-left" />
+            <div className="hud-corner-bracket bottom-right" />
+            <div className="hud-reticle-center" />
+
+            <div className="camera-overlay">
+              <span>
+                <span className="live-dot" /> SENSOR STREAM LIVE
+              </span>
+              <small className={engineClass}>{engineNote}</small>
+            </div>
+
+            {frameResult && (
+              <>
+                <svg
+                  className="camera-detection-boxes"
+                  viewBox={`0 0 ${frameWidth} ${frameHeight}`}
+                  preserveAspectRatio="xMidYMid slice"
+                  role="img"
+                  aria-label="Live vehicle and plate detection boxes"
+                >
+                  {vehicleBox && (
+                    <g>
+                      <rect
+                        x={vehicleBox[0]}
+                        y={vehicleBox[1]}
+                        width={vehicleBox[2] - vehicleBox[0]}
+                        height={vehicleBox[3] - vehicleBox[1]}
+                        className="vehicle-detection-box"
+                      />
+                      <rect
+                        x={vehicleBox[0]}
+                        y={Math.max(0, vehicleBox[1] - 22)}
+                        width={Math.max(80, (frameResult.vehicle_type || "Vehicle").length * 10 + 20)}
+                        height={20}
+                        fill="rgba(15, 23, 42, 0.85)"
+                        rx={3}
+                      />
+                      <text
+                        x={vehicleBox[0] + 6}
+                        y={Math.max(14, vehicleBox[1] - 8)}
+                        className="vehicle-detection-label"
+                        fill="#38BDF8"
+                        fontWeight="700"
+                        fontSize="11"
+                        fontFamily="'JetBrains Mono', monospace"
+                      >
+                        {frameResult.vehicle_type ? frameResult.vehicle_type.toUpperCase() : "VEHICLE"}
+                      </text>
+                    </g>
+                  )}
+                  {plateBox && (
+                    <g>
+                      <rect
+                        x={plateBox[0]}
+                        y={plateBox[1]}
+                        width={plateBox[2] - plateBox[0]}
+                        height={plateBox[3] - plateBox[1]}
+                        className="plate-detection-box"
+                        style={{ stroke: plateBg, strokeWidth: 3 }}
+                      />
+                      <rect
+                        x={plateBox[0]}
+                        y={Math.max(0, plateBox[1] - 24)}
+                        width={Math.max(90, (plateCategory.length + 8) * 8)}
+                        height={22}
+                        fill={plateBg}
+                        rx={3}
+                      />
+                      <text
+                        x={plateBox[0] + 6}
+                        y={Math.max(15, plateBox[1] - 8)}
+                        className="plate-detection-label"
+                        fill={plateText}
+                        fontWeight="800"
+                        fontSize="11"
+                        fontFamily="'JetBrains Mono', monospace"
+                      >
+                        {plateCategory} • {frameResult?.plate || "SCANNING"}
+                      </text>
+                    </g>
+                  )}
+                </svg>
+
+                <div className="camera-readout" aria-live="polite">
+                  <div className="camera-readout-heading">
+                    <strong>
+                      {upper(readoutText)}
+                      {frameResult?.plate_width_pixels ? ` · ${frameResult.plate_width_pixels}px` : ""}
+                    </strong>
+                    <div className="camera-readout-tags">
+                      {frameResult?.plate && (
+                        <span className="plate-category-badge" style={{ background: plateBg, color: plateText }}>
+                          {plateCategory}
+                        </span>
+                      )}
+                      <span className="status-sub-pill">
+                        {frameResult?.plate ? (upper(readoutStatus) || "RECOGNIZED") : "SCANNING FOR VEHICLE"}
+                      </span>
+                      {frameResult?.ocr_confidence > 0 && (
+                        <span className="confidence-pill">
+                          {(Number(frameResult.ocr_confidence) * 100).toFixed(1)}%
+                        </span>
+                      )}
+                      {frameResult?.decision && (
+                        <span className={`decision-pill ${cls(frameResult.decision)}`}>
+                          {upper(frameResult.decision)}
+                        </span>
+                      )}
+                      {frameResult?.persisted === false && frameResult?.persistence_error && (
+                        <span className="error-pill">NOT SAVED</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="camera-timing-grid">
+                    {[
+                      ["OCR load", startupTimings?.ocr_model_load_ms],
+                      ["Plate model load", startupTimings?.plate_model_load_ms],
+                      ...measureRows,
+                    ]
+                      .filter(([, value]) => value !== undefined && value !== null)
+                      .map(([label, value]) => (
+                        <span key={label}>
+                          {label} <b>{(Number(value) / 1000).toFixed(2)}s</b>
+                        </span>
+                      ))}
+                  </div>
+                </div>
+              </>
+            )}
+            <div className="camera-stats">
+              <span>{resolution || "connecting..."}</span>
+              <span>~{fps} fps</span>
+            </div>
+          </>
+        ) : (
+          <div className="camera-offline-hud">
+            <CarFront size={56} className="camera-pulse-icon" />
+            <p>{cameraOn ? "Sensor Hardware Unavailable" : "Camera Sensor Standby"}</p>
+            <small>
+              {cameraOn ? error || "CLICK RESTART OR VERIFY CAMERA PERMISSIONS." : "INITIALIZE OPTICAL STREAM TO BEGIN LIVE DETECTION."}
+            </small>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
+
 function Detection({ current }) {
   const activeCurrent = current ? normalizeLiveEvent(current) : null;
-  return <div className="detection-panel">
-    <div className="section-heading"><div><p className="eyebrow">Latest signal</p><h2>Current detection</h2></div><Activity size={19} /></div>
-    {activeCurrent ? <>
-      <div className={`decision ${cls(activeCurrent.status)}`}><span>LIVE DATA - {upper(activeCurrent.status)}</span><strong>{upper(activeCurrent.plateNumber || "NO READABLE PLATE")}</strong></div>
-      <dl>
-        <div><dt>Owner</dt><dd>{upper(activeCurrent.owner || activeCurrent.ownerName || "Unknown")}</dd></div>
-        <div><dt>Vehicle model</dt><dd>{upper([activeCurrent.make, activeCurrent.model].filter(Boolean).join(" ") || activeCurrent.vehicleType || "Unknown")}</dd></div>
-        <div><dt>OCR text</dt><dd>{upper(activeCurrent.raw_ocr || activeCurrent.rawOcr || activeCurrent.plateNumber || "-")}</dd></div>
-        <div><dt>OCR confidence</dt><dd>{activeCurrent.ocrConfidence > 0 ? `${(activeCurrent.ocrConfidence * 100).toFixed(1)}%` : "N/A"}</dd></div>
-        <div><dt>Decision</dt><dd>{upper(activeCurrent.decision || "UNKNOWN")}</dd></div>
-        <div><dt>Purpose</dt><dd>{upper(activeCurrent.purpose || "Unknown")}</dd></div>
-        <div><dt>Invitation</dt><dd>{upper(activeCurrent.invitationStatus || activeCurrent.invitation_status || "NONE")}</dd></div>
-        <div><dt>Detected at</dt><dd>{activeCurrent.timestamp ? new Date(activeCurrent.timestamp).toLocaleString() : "-"}</dd></div>
-      </dl>
-    </> : <div className="empty">No detections yet. Turn on the live camera or start the Python AI service to begin streaming.</div>}
-  </div>;
+  const plateStyling = activeCurrent?.plate_styling || null;
+  const categoryName = activeCurrent?.plate_category || plateStyling?.category || (activeCurrent?.plateNumber ? resolvePlateCategory(activeCurrent.plateNumber).name : "PRIVATE");
+  const catColor = activeCurrent?.plate_bg_hex || plateStyling?.bg_hex || (activeCurrent?.plateNumber ? resolvePlateCategory(activeCurrent.plateNumber).color : "#FFFFFF");
+  const catTextColor = activeCurrent?.plate_text_hex || plateStyling?.text_hex || (activeCurrent?.plateNumber ? resolvePlateCategory(activeCurrent.plateNumber).text : "#0F172A");
+  const VehicleIcon = getVehicleIcon(activeCurrent?.vehicleType || activeCurrent?.vehicle_type);
+
+  return (
+    <div className="detection-panel oled-chassis">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Realtime AI Telemetry</p>
+          <h2>Current detection</h2>
+        </div>
+        <Activity size={19} className="signal-pulse" />
+      </div>
+      {activeCurrent ? (
+        <>
+          <div className={`decision ${cls(activeCurrent.status)}`}>
+            <div className="decision-header-bar">
+              <span>LIVE DATA - {upper(activeCurrent.status)}</span>
+              <span
+                className="category-pill-badge"
+                style={{ background: catColor, color: catTextColor, border: catColor === "#FFFFFF" ? "1px solid #CBD5E1" : "none" }}
+              >
+                {categoryName}
+              </span>
+            </div>
+            <strong>{upper(activeCurrent.plateNumber || "NO READABLE PLATE")}</strong>
+          </div>
+          <dl>
+            <div>
+              <dt>Owner</dt>
+              <dd>{upper(activeCurrent.owner || activeCurrent.ownerName || "Unknown")}</dd>
+            </div>
+            <div>
+              <dt>Vehicle model</dt>
+              <dd className="vehicle-model-row">
+                <VehicleIcon size={15} />
+                <span>
+                  {upper(
+                    [activeCurrent.make, activeCurrent.model].filter(Boolean).join(" ") ||
+                      activeCurrent.vehicleType ||
+                      "Unknown"
+                  )}
+                </span>
+              </dd>
+            </div>
+            <div>
+              <dt>Classification</dt>
+              <dd>
+                <span className="live-classification-tag" style={{ color: catColor === "#FFFFFF" ? "#6366F1" : catColor }}>
+                  ● {categoryName}
+                </span>
+              </dd>
+            </div>
+            <div>
+              <dt>OCR text</dt>
+              <dd>{upper(activeCurrent.raw_ocr || activeCurrent.rawOcr || activeCurrent.plateNumber || "-")}</dd>
+            </div>
+            <div>
+              <dt>OCR confidence</dt>
+              <dd>{activeCurrent.ocrConfidence > 0 ? `${(activeCurrent.ocrConfidence * 100).toFixed(1)}%` : "N/A"}</dd>
+            </div>
+            <div>
+              <dt>Decision</dt>
+              <dd>{upper(activeCurrent.decision || "UNKNOWN")}</dd>
+            </div>
+            <div>
+              <dt>Purpose</dt>
+              <dd>{upper(activeCurrent.purpose || "Unknown")}</dd>
+            </div>
+            <div>
+              <dt>Detected at</dt>
+              <dd>{activeCurrent.timestamp ? new Date(activeCurrent.timestamp).toLocaleString() : "-"}</dd>
+            </div>
+          </dl>
+        </>
+      ) : (
+        <div className="empty">No detections yet. Turn on the live camera or start the Python AI service to begin streaming.</div>
+      )}
+    </div>
+  );
 }
-function Dashboard({ stats, detections, current, cameraOn, toggleCamera, onDetection, openLookup, visits }) { const prefersReduced = useReducedMotion(); const cards = [["Detected today", stats.total, CarFront], ["Registered vehicles", stats.vehicles, CarFront], ["Visits today", stats.visits, Activity], ["Authorized today", stats.authorized, ShieldCheck], ["Unauthorized today", stats.unauthorized, ShieldX], ["Unknown today", stats.unknown, CircleAlert], ["Inside now", stats.inside, Activity]]; return <><Actions openLookup={openLookup} /><section className="stat-grid">{cards.map(([label, value, Icon]) => <motion.div className="stat" key={label} whileHover={prefersReduced ? {} : { y: -4 }} transition={{ type: "spring", stiffness: 380, damping: 22 }}><div className="stat-icon"><Icon size={18} /></div><span>{label}</span><strong>{value}</strong></motion.div>)}</section><section className="content-grid"><Camera cameraOn={cameraOn} toggleCamera={toggleCamera} onDetection={onDetection} /><Detection current={current} /></section><VehicleVisitTable visits={visits} vehicles={getVehiclesSync()} title="Live vehicle activity" /></>; }
+function Dashboard({ stats, detections, current, cameraOn, toggleCamera, onDetection, openLookup, visits }) { const prefersReduced = useReducedMotion(); const cards = [["Detected today", stats.total, CarFront], ["Registered vehicles", stats.vehicles, CarFront], ["Visits today", stats.visits, Activity], ["Authorized today", stats.authorized, ShieldCheck], ["Unauthorized today", stats.unauthorized, ShieldX], ["Unknown today", stats.unknown, CircleAlert], ["Inside now", stats.inside, Activity]]; return <><Actions openLookup={openLookup} /><section className="stat-grid">{cards.map(([label, value, Icon]) => <motion.div className="stat" key={label} whileHover={prefersReduced ? {} : { y: -4 }} transition={{ type: "spring", stiffness: 380, damping: 22 }}><div className="stat-icon"><Icon size={18} /></div><span>{label}</span><strong key={value} className="stat-value">{value}</strong></motion.div>)}</section><section className="content-grid"><Camera cameraOn={cameraOn} toggleCamera={toggleCamera} onDetection={onDetection} /><Detection current={current} /></section><VehicleVisitTable visits={visits} vehicles={getVehiclesSync()} title="Live vehicle activity" /></>; }
 function resolvedHistoryStatus(item) {
   const stored = String(item.status || item.authorization_status || item.decision || "").toUpperCase();
   if (stored) return stored;
@@ -1150,21 +1816,22 @@ function visitRow(visit, vehicles, invitations) {
 
 function VehicleVisitTable({ visits = [], vehicles = [], title = "Vehicle activity" }) {
   const [search, setSearch] = useState("");
+  const debouncedSearch = useDebouncedValue(search);
   const [sort, setSort] = useState({ key: "entry", direction: "desc" });
   const [page, setPage] = useState(1);
   const [exporting, setExporting] = useState("");
   const [message, setMessage] = useState("");
   const invitations = getCollection("invitations");
   const rows = visits.map((visit) => visitRow(visit, vehicles, invitations));
-  const filtered = rows.filter((row) => `${row.plate} ${row.owner}`.toLowerCase().includes(search.trim().toLowerCase())).sort((left, right) => { const a = sort.key === "entry" ? new Date(left.entry || 0).getTime() : String(left[sort.key] ?? "").toLowerCase(); const b = sort.key === "entry" ? new Date(right.entry || 0).getTime() : String(right[sort.key] ?? "").toLowerCase(); const result = a < b ? -1 : a > b ? 1 : 0; return sort.direction === "asc" ? result : -result; });
+  const filtered = rows.filter((row) => `${row.plate} ${row.owner}`.toLowerCase().includes(debouncedSearch.trim().toLowerCase())).sort((left, right) => { const a = sort.key === "entry" ? new Date(left.entry || 0).getTime() : String(left[sort.key] ?? "").toLowerCase(); const b = sort.key === "entry" ? new Date(right.entry || 0).getTime() : String(right[sort.key] ?? "").toLowerCase(); const result = a < b ? -1 : a > b ? 1 : 0; return sort.direction === "asc" ? result : -result; });
   const pageCount = Math.max(1, Math.ceil(filtered.length / 25));
   const visible = filtered.slice((Math.min(page, pageCount) - 1) * 25, Math.min(page, pageCount) * 25);
   const columns = [["plate", "Plate"], ["owner", "Owner"], ["vehicleType", "Vehicle Type"], ["purpose", "Purpose"], ["entry", "Entry Time"], ["exit", "Exit Time"], ["duration", "Duration"], ["registryStatus", "Registry"], ["status", "Event Status"]];
   const setSortKey = (key) => { setPage(1); setSort((current) => ({ key, direction: current.key === key && current.direction === "asc" ? "desc" : "asc" })); };
   const exportRows = filtered.map((row) => ({ Plate: row.plate, Owner: row.owner, "Vehicle Type": row.vehicleType, Purpose: row.purpose, "Entry Time": row.entry ? new Date(row.entry).toLocaleString() : "-", "Exit Time": row.exit ? new Date(row.exit).toLocaleString() : "Inside", Duration: row.duration, Registry: row.registryStatus, "Event Status": row.status }));
   const exported = () => { setExporting(""); setMessage("Report downloaded"); window.setTimeout(() => setMessage(""), 2400); };
-  const exportExcel = async () => { setExporting("excel"); await new Promise((resolve) => window.setTimeout(resolve, 0)); const worksheet = XLSX.utils.json_to_sheet(exportRows); const headers = Object.keys(exportRows[0] || { Plate: "" }); headers.forEach((header, index) => { const cell = worksheet[XLSX.utils.encode_cell({ r: 0, c: index })]; if (cell) cell.s = { font: { bold: true, color: { rgb: "FFFFFF" } }, fill: { fgColor: { rgb: "0891B2" } } }; }); worksheet["!cols"] = headers.map(() => ({ wch: 22 })); const workbook = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(workbook, worksheet, "Vehicle Report"); XLSX.writeFile(workbook, `nexplate-report-${new Date().toISOString().slice(0, 10)}.xlsx`); exported(); };
-  const exportPdf = async () => { setExporting("pdf"); await new Promise((resolve) => window.setTimeout(resolve, 0)); const document = new jsPDF({ orientation: "landscape" }); document.setFontSize(15); document.text("NexPlate AI - Vehicle Report", 14, 15); document.setFontSize(9); document.text(`Exported ${new Date().toLocaleString()}${search ? ` | Search: ${search}` : ""}`, 14, 22); autoTable(document, { head: [Object.keys(exportRows[0] || { Plate: "" })], body: exportRows.map((row) => Object.values(row)), startY: 28, styles: { fontSize: 8 }, headStyles: { fillColor: [6, 182, 212] }, margin: { left: 10, right: 10 }, showHead: "everyPage" }); document.save(`nexplate-report-${new Date().toISOString().slice(0, 10)}.pdf`); exported(); };
+  const exportExcel = async () => { setExporting("excel"); try { const XLSX = await import("xlsx-js-style"); const worksheet = XLSX.utils.json_to_sheet(exportRows); const headers = Object.keys(exportRows[0] || { Plate: "" }); headers.forEach((header, index) => { const cell = worksheet[XLSX.utils.encode_cell({ r: 0, c: index })]; if (cell) cell.s = { font: { bold: true, color: { rgb: "FFFFFF" } }, fill: { fgColor: { rgb: "5B5FEF" } } }; }); worksheet["!cols"] = headers.map(() => ({ wch: 22 })); const workbook = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(workbook, worksheet, "Vehicle Report"); XLSX.writeFile(workbook, `nexplate-report-${new Date().toISOString().slice(0, 10)}.xlsx`); exported(); } catch (error) { setExporting(""); setMessage(error.message || "Excel export failed"); } };
+  const exportPdf = async () => { setExporting("pdf"); try { const [{ jsPDF }, { default: autoTable }] = await Promise.all([import("jspdf"), import("jspdf-autotable")]); const document = new jsPDF({ orientation: "landscape" }); document.setFontSize(15); document.text("NexPlate AI - Vehicle Report", 14, 15); document.setFontSize(9); document.text(`Exported ${new Date().toLocaleString()}${search ? ` | Search: ${search}` : ""}`, 14, 22); autoTable(document, { head: [Object.keys(exportRows[0] || { Plate: "" })], body: exportRows.map((row) => Object.values(row)), startY: 28, styles: { fontSize: 8 }, headStyles: { fillColor: [91, 95, 239] }, margin: { left: 10, right: 10 }, showHead: "everyPage" }); document.save(`nexplate-report-${new Date().toISOString().slice(0, 10)}.pdf`); exported(); } catch (error) { setExporting(""); setMessage(error.message || "PDF export failed"); } };
   return <section className="table-panel live-table">
     <div className="section-heading">
       <div>
@@ -1254,9 +1921,14 @@ function Registration({ nav, notify, vehicles }) {
   const [customer, setCustomer] = useState(null);
   const [form, setForm] = useState({ plateNumber: "", vehicleType: "Car", make: "", model: "", color: "", ownerName: "", ownerPhone: "", ownerEmail: "", houseNo: "", driverName: "", driverPhone: "", purpose: "Employee", accessType: "Permanent", validFrom: "", validUntil: "", password: "" });
   const [customerQuery, setCustomerQuery] = useState("");
+  const debouncedCustomerQuery = useDebouncedValue(customerQuery);
   const change = (event) => setForm((current) => ({ ...current, [event.target.name]: event.target.value }));
-  const customerMatches = customerQuery.length > 1 ? vehicles.filter((vehicle) => [vehicle.ownerName, vehicle.ownerPhone, vehicle.customerCode, vehicle.ownerEmail, vehicle.houseNo].some((value) => String(value || "").toLowerCase().includes(customerQuery.toLowerCase()))).slice(0, 6) : [];
+  const customerMatches = debouncedCustomerQuery.length > 1 ? vehicles.filter((vehicle) => [vehicle.ownerName, vehicle.ownerPhone, vehicle.customerCode, vehicle.ownerEmail, vehicle.houseNo].some((value) => String(value || "").toLowerCase().includes(debouncedCustomerQuery.toLowerCase()))).slice(0, 6) : [];
   const selectCustomer = (vehicle) => { setCustomer(vehicle); setCustomerQuery(vehicle.ownerName || vehicle.customerCode || ""); setForm((current) => ({ ...current, ownerName: vehicle.ownerName || "", ownerPhone: vehicle.ownerPhone || "", houseNo: vehicle.houseNo || "" })); };
+
+  const previewPlate = normalizePlate(form.plateNumber);
+  const isPlateValid = isIndianPlateFormat(previewPlate);
+
   const submit = async (event) => {
     event.preventDefault();
     const plateNumber = normalizePlate(form.plateNumber);
@@ -1271,7 +1943,90 @@ function Registration({ nav, notify, vehicles }) {
     } catch (error) { notify(error.message || "Registration failed"); }
   };
   const fields = [["plateNumber", "License plate *"], ["make", "Vehicle make *"], ["model", "Vehicle model *"], ["color", "Color"], ["ownerEmail", "Email"], ["validFrom", "Valid from"], ["validUntil", "Valid until"]];
-  return <section className="page-panel registration"><div className="section-heading"><div><p className="eyebrow">Registry portal</p><h2>{mode === "NEW" ? "Register vehicle and customer" : "Add vehicle to existing customer"}</h2></div><RegistrationTools notify={notify} /></div><div className="auth-switch registration-mode"><button type="button" className={mode === "NEW" ? "active" : ""} onClick={() => setMode("NEW")}>New Customer</button><button type="button" className={mode === "EXISTING" ? "active" : ""} onClick={() => setMode("EXISTING")}>Existing Customer</button></div>{mode === "EXISTING" && <div className="customer-picker"><input value={customerQuery} onChange={(event) => { setCustomerQuery(event.target.value); setCustomer(null); }} placeholder="Search by name, phone, or Customer ID" />{customerMatches.length > 0 && <div className="suggestion-menu">{customerMatches.map((vehicle) => <button type="button" key={vehicle.id} onClick={() => selectCustomer(vehicle)}><strong>{vehicle.ownerName}</strong><small>{vehicle.customerCode || "Customer"} · {vehicle.plateNumber}</small></button>)}</div>}{customer && <div className="customer-summary"><strong>{customer.ownerName}</strong><span>{customer.houseNo || "Site not set"} · {customer.ownerPhone || "Phone not set"}</span><small>{vehicles.filter((vehicle) => vehicle.customer_id === customer.customer_id || vehicle.ownerName === customer.ownerName).map((vehicle) => `${vehicle.plateNumber} · ${vehicle.vehicleType}`).join(" | ")}</small></div>}</div>}<form onSubmit={submit}><div className="form-grid">{mode === "NEW" && <><label>Owner name *<input name="ownerName" value={form.ownerName} onChange={change} required placeholder="Owner name" /></label><label>Owner phone<input name="ownerPhone" value={form.ownerPhone} onChange={change} placeholder="Phone" /></label><label>Owner email<input name="ownerEmail" value={form.ownerEmail} onChange={change} placeholder="Email" type="email" /></label><label>Site / unit<input name="houseNo" value={form.houseNo} onChange={change} placeholder="Site or unit" /></label><label>Driver name<input name="driverName" value={form.driverName} onChange={change} placeholder="Driver name" /></label><label>Driver phone<input name="driverPhone" value={form.driverPhone} onChange={change} placeholder="Driver phone" /></label><label>Customer password *<input type="password" name="password" value={form.password} onChange={change} required placeholder="Customer password" /></label></>}{fields.map(([name, label]) => <label key={name}>{label}<input type={name.startsWith("valid") ? "date" : "text"} name={name} value={form[name]} onChange={change} required={name === "plateNumber" || name === "make" || name === "model"} placeholder={label} /></label>)}<Select name="vehicleType" value={form.vehicleType} onChange={change} values={typesForForm} label="Vehicle type" /><Select name="purpose" value={form.purpose} onChange={change} values={["Resident", "Employee", "Student", "Visitor", "Delivery", "Faculty", "Maintenance", "Official", "Emergency", "Guest", "Service"]} label="Purpose" /><Select name="accessType" value={form.accessType} onChange={change} values={["Permanent", "Temporary", "Invitation Based"]} label="Access type" /></div><div className="form-footer"><span>{mode === "NEW" ? "Customer ID is generated on save." : `Selected customer: ${customer?.ownerName || "none"}`}</span><button type="submit"><UserPlus size={15} /> {mode === "NEW" ? "Save vehicle and account" : `Add Vehicle to ${customer?.ownerName || "customer"}`}</button></div></form></section>;
+  return (
+    <section className="page-panel registration">
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Registry portal</p>
+          <h2>{mode === "NEW" ? "Register vehicle and customer" : "Add vehicle to existing customer"}</h2>
+        </div>
+        <RegistrationTools notify={notify} />
+      </div>
+
+      <div className="auth-switch registration-mode">
+        <button type="button" className={mode === "NEW" ? "active" : ""} onClick={() => setMode("NEW")}>New Customer</button>
+        <button type="button" className={mode === "EXISTING" ? "active" : ""} onClick={() => setMode("EXISTING")}>Existing Customer</button>
+      </div>
+
+      {previewPlate && (
+        <div className="plate-preview-card">
+          <div className="hsrp-badge">
+            <div className="hsrp-ind-strip">
+              <div className="hsrp-ashoka-circle" />
+              <span>IND</span>
+            </div>
+            <div className="hsrp-number">{previewPlate}</div>
+          </div>
+          <div className="plate-meta-info">
+            <span className="plate-meta-state">{isPlateValid ? "✔ Valid Indian Registration Format" : "Entering Registration Plate..."}</span>
+            <span className="plate-meta-format">{isPlateValid ? "Eligible for automatic camera recognition and gate authorization" : "Standard: 2 Letters (State) + 1-2 Digits + Series + Number"}</span>
+          </div>
+        </div>
+      )}
+
+      {mode === "EXISTING" && (
+        <div className="customer-picker">
+          <input value={customerQuery} onChange={(event) => { setCustomerQuery(event.target.value); setCustomer(null); }} placeholder="Search existing customer by name, phone, or Customer ID" />
+          {customerMatches.length > 0 && (
+            <div className="suggestion-menu">
+              {customerMatches.map((vehicle) => (
+                <button type="button" key={vehicle.id} onClick={() => selectCustomer(vehicle)}>
+                  <strong>{vehicle.ownerName}</strong>
+                  <small>{vehicle.customerCode || "Customer"} · {vehicle.plateNumber}</small>
+                </button>
+              ))}
+            </div>
+          )}
+          {customer && (
+            <div className="customer-summary">
+              <strong>{customer.ownerName}</strong>
+              <span>{customer.houseNo || "Site not set"} · {customer.ownerPhone || "Phone not set"}</span>
+              <small>{vehicles.filter((vehicle) => vehicle.customer_id === customer.customer_id || vehicle.ownerName === customer.ownerName).map((vehicle) => `${vehicle.plateNumber} · ${vehicle.vehicleType}`).join(" | ")}</small>
+            </div>
+          )}
+        </div>
+      )}
+
+      <form onSubmit={submit}>
+        <div className="form-grid">
+          {mode === "NEW" && (
+            <>
+              <label>Owner name *<input name="ownerName" value={form.ownerName} onChange={change} required placeholder="Owner name" /></label>
+              <label>Owner phone<input name="ownerPhone" value={form.ownerPhone} onChange={change} placeholder="Phone" /></label>
+              <label>Owner email<input name="ownerEmail" value={form.ownerEmail} onChange={change} placeholder="Email" type="email" /></label>
+              <label>Site / unit<input name="houseNo" value={form.houseNo} onChange={change} placeholder="Site or unit" /></label>
+              <label>Driver name<input name="driverName" value={form.driverName} onChange={change} placeholder="Driver name" /></label>
+              <label>Driver phone<input name="driverPhone" value={form.driverPhone} onChange={change} placeholder="Driver phone" /></label>
+              <label>Customer password *<input type="password" name="password" value={form.password} onChange={change} required placeholder="Customer password" /></label>
+            </>
+          )}
+          {fields.map(([name, label]) => (
+            <label key={name}>
+              {label}
+              <input type={name.startsWith("valid") ? "date" : "text"} name={name} value={form[name]} onChange={change} required={name === "plateNumber" || name === "make" || name === "model"} placeholder={label} />
+            </label>
+          ))}
+          <Select name="vehicleType" value={form.vehicleType} onChange={change} values={typesForForm} label="Vehicle type" />
+          <Select name="purpose" value={form.purpose} onChange={change} values={["Resident", "Employee", "Student", "Visitor", "Delivery", "Faculty", "Maintenance", "Official", "Emergency", "Guest", "Service"]} label="Purpose" />
+          <Select name="accessType" value={form.accessType} onChange={change} values={["Permanent", "Temporary", "Invitation Based"]} label="Access type" />
+        </div>
+        <div className="form-footer">
+          <span>{mode === "NEW" ? "Customer ID is generated on save." : `Selected customer: ${customer?.ownerName || "none"}`}</span>
+          <button type="submit"><UserPlus size={15} /> {mode === "NEW" ? "Save vehicle and account" : `Add Vehicle to ${customer?.ownerName || "customer"}`}</button>
+        </div>
+      </form>
+    </section>
+  );
 }
 function Select({ name, value, onChange, values, label }) { return <label>{label}<select name={name} value={value} onChange={onChange}>{values.map((item) => { const optionValue = String(item).includes("|") ? String(item).split("|")[0] : item; const optionLabel = String(item).includes("|") ? String(item).split("|").slice(1).join("|") : item; return <option key={optionValue} value={optionValue}>{optionLabel}</option>; })}</select></label>; }
 function Validator({ vehicles, nav }) {
@@ -1288,7 +2043,7 @@ function Validator({ vehicles, nav }) {
     if (!normalized) return;
     setLoading(true);
     try {
-      const valid = /^(AP|TS|TN|KA)\d{1,2}[A-Z]{1,3}\d{1,4}$/.test(normalized);
+      const valid = isIndianPlateFormat(normalized);
       const context = await getPlateContextAPI(normalized);
       let vehicle = null;
       let visits = [];
